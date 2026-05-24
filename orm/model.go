@@ -1,0 +1,422 @@
+package orm
+
+import (
+	"database/sql"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+)
+
+// Model provides CRUD operations for a specific struct type
+type Model struct {
+	db        *DB
+	info      *ModelInfo
+	modelType reflect.Type
+}
+
+// NewModel creates a Model handler for the given struct
+func NewModel(db *DB, model interface{}) (*Model, error) {
+	info, err := db.RegisterModel(model)
+	if err != nil {
+		return nil, err
+	}
+
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	return &Model{
+		db:        db,
+		info:      info,
+		modelType: t,
+	}, nil
+}
+
+// Create inserts a new record
+func (m *Model) Create(record interface{}) error {
+	v := reflect.ValueOf(record)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	columns := make([]string, 0)
+	values := make([]interface{}, 0)
+	placeholders := make([]string, 0)
+
+	for _, field := range m.info.Fields {
+		if field.IsAutoInc {
+			continue
+		}
+
+		fv := v.FieldByName(field.Name)
+		if !fv.IsValid() {
+			continue
+		}
+
+		// Set timestamps
+		if field.Column == m.info.CreatedAt || field.Column == m.info.UpdatedAt {
+			if fv.Type() == reflect.TypeOf(time.Time{}) && fv.Interface().(time.Time).IsZero() {
+				fv.Set(reflect.ValueOf(time.Now()))
+			}
+		}
+
+		columns = append(columns, field.Column)
+		values = append(values, fv.Interface())
+		placeholders = append(placeholders, "?")
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		m.info.TableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	result, err := m.db.Exec(query, values...)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") {
+			return ErrDuplicateKey
+		}
+		return err
+	}
+
+	// Set auto-increment ID back to struct
+	if m.info.PrimaryKey != "" {
+		lastID, err := result.LastInsertId()
+		if err == nil {
+			pkField := v.FieldByName(m.getPKFieldName())
+			if pkField.IsValid() && pkField.CanSet() {
+				pkField.SetInt(lastID)
+			}
+		}
+	}
+
+	return nil
+}
+
+// CreateBatch inserts multiple records
+// BUG: builds unbounded query string, can exceed MySQL max_allowed_packet
+func (m *Model) CreateBatch(records interface{}) error {
+	rv := reflect.ValueOf(records)
+	if rv.Kind() != reflect.Slice {
+		return fmt.Errorf("CreateBatch requires a slice, got %T", records)
+	}
+
+	if rv.Len() == 0 {
+		return nil
+	}
+
+	// Get columns from first record
+	first := rv.Index(0)
+	if first.Kind() == reflect.Ptr {
+		first = first.Elem()
+	}
+
+	columns := make([]string, 0)
+	for _, field := range m.info.Fields {
+		if field.IsAutoInc {
+			continue
+		}
+		columns = append(columns, field.Column)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES ",
+		m.info.TableName,
+		strings.Join(columns, ", "),
+	))
+
+	allValues := make([]interface{}, 0)
+	for i := 0; i < rv.Len(); i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+
+		record := rv.Index(i)
+		if record.Kind() == reflect.Ptr {
+			record = record.Elem()
+		}
+
+		placeholders := make([]string, 0, len(columns))
+		for _, field := range m.info.Fields {
+			if field.IsAutoInc {
+				continue
+			}
+			fv := record.FieldByName(field.Name)
+			allValues = append(allValues, fv.Interface())
+			placeholders = append(placeholders, "?")
+		}
+		sb.WriteString(fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+	}
+
+	_, err := m.db.Exec(sb.String(), allValues...)
+	return err
+}
+
+// Find retrieves a record by primary key
+func (m *Model) Find(dest interface{}, id interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?",
+		m.info.TableName,
+		m.info.PrimaryKey,
+	)
+
+	// Add soft delete filter
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	query += " LIMIT 1"
+
+	row := m.db.QueryRow(query, id)
+	return scanStruct(row, dest)
+}
+
+// FindBy retrieves records by a specific column
+func (m *Model) FindBy(dest interface{}, column string, value interface{}) error {
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", m.info.TableName, column)
+
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	rows, err := m.db.Query(query, value)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return scanSlice(rows, dest)
+}
+
+// Update updates a record
+func (m *Model) Update(record interface{}) error {
+	v := reflect.ValueOf(record)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	setClauses := make([]string, 0)
+	values := make([]interface{}, 0)
+	var pkValue interface{}
+
+	for _, field := range m.info.Fields {
+		fv := v.FieldByName(field.Name)
+		if !fv.IsValid() {
+			continue
+		}
+
+		if field.IsPrimary {
+			pkValue = fv.Interface()
+			continue
+		}
+
+		// Update timestamp
+		if field.Column == m.info.UpdatedAt {
+			fv.Set(reflect.ValueOf(time.Now()))
+		}
+
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", field.Column))
+		values = append(values, fv.Interface())
+	}
+
+	if pkValue == nil {
+		return ErrNoPrimaryKey
+	}
+
+	values = append(values, pkValue)
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?",
+		m.info.TableName,
+		strings.Join(setClauses, ", "),
+		m.info.PrimaryKey,
+	)
+
+	result, err := m.db.Exec(query, values...)
+	if err != nil {
+		return err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrRecordNotFound
+	}
+
+	return nil
+}
+
+// UpdateColumns updates specific columns only
+func (m *Model) UpdateColumns(id interface{}, columns map[string]interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+
+	setClauses := make([]string, 0)
+	values := make([]interface{}, 0)
+
+	// BUG: no validation that column names are valid - allows SQL injection via column names
+	for col, val := range columns {
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
+		values = append(values, val)
+	}
+
+	values = append(values, id)
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?",
+		m.info.TableName,
+		strings.Join(setClauses, ", "),
+		m.info.PrimaryKey,
+	)
+
+	_, err := m.db.Exec(query, values...)
+	return err
+}
+
+// Delete removes a record (soft delete if configured)
+func (m *Model) Delete(id interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+
+	var query string
+	if m.info.SoftDelete != "" {
+		query = fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s = ?",
+			m.info.TableName, m.info.SoftDelete, m.info.PrimaryKey)
+		_, err := m.db.Exec(query, time.Now(), id)
+		return err
+	}
+
+	query = fmt.Sprintf("DELETE FROM %s WHERE %s = ?", m.info.TableName, m.info.PrimaryKey)
+	_, err := m.db.Exec(query, id)
+	return err
+}
+
+// HardDelete always performs a physical delete
+func (m *Model) HardDelete(id interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", m.info.TableName, m.info.PrimaryKey)
+	_, err := m.db.Exec(query, id)
+	return err
+}
+
+// Count returns the total number of records
+func (m *Model) Count() (int64, error) {
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", m.info.TableName)
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" WHERE %s IS NULL", m.info.SoftDelete)
+	}
+
+	var count int64
+	err := m.db.QueryRow(query).Scan(&count)
+	return count, err
+}
+
+// All retrieves all records
+// BUG: no pagination - loads entire table into memory
+func (m *Model) All(dest interface{}) error {
+	query := fmt.Sprintf("SELECT * FROM %s", m.info.TableName)
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" WHERE %s IS NULL", m.info.SoftDelete)
+	}
+
+	rows, err := m.db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return scanSlice(rows, dest)
+}
+
+// Query returns a QueryBuilder scoped to this model's table
+func (m *Model) Query() *QueryBuilder {
+	qb := m.db.Table(m.info.TableName)
+	if m.info.SoftDelete != "" {
+		qb.WhereNull(m.info.SoftDelete)
+	}
+	return qb
+}
+
+// WithTrashed includes soft-deleted records
+func (m *Model) WithTrashed() *QueryBuilder {
+	return m.db.Table(m.info.TableName)
+}
+
+// OnlyTrashed returns only soft-deleted records
+func (m *Model) OnlyTrashed() *QueryBuilder {
+	return m.db.Table(m.info.TableName).WhereNotNull(m.info.SoftDelete)
+}
+
+// Restore un-deletes a soft-deleted record
+func (m *Model) Restore(id interface{}) error {
+	if m.info.SoftDelete == "" {
+		return fmt.Errorf("model %s does not support soft delete", m.info.Name)
+	}
+
+	query := fmt.Sprintf("UPDATE %s SET %s = NULL WHERE %s = ?",
+		m.info.TableName, m.info.SoftDelete, m.info.PrimaryKey)
+	_, err := m.db.Exec(query, id)
+	return err
+}
+
+func (m *Model) getPKFieldName() string {
+	for _, field := range m.info.Fields {
+		if field.IsPrimary {
+			return field.Name
+		}
+	}
+	return ""
+}
+
+// scanStruct scans a single row into a struct
+func scanStruct(row *sql.Row, dest interface{}) error {
+	v := reflect.ValueOf(dest)
+	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+		return ErrInvalidModel
+	}
+	v = v.Elem()
+
+	fields := make([]interface{}, v.NumField())
+	for i := 0; i < v.NumField(); i++ {
+		fields[i] = v.Field(i).Addr().Interface()
+	}
+
+	return row.Scan(fields...)
+}
+
+// scanSlice scans multiple rows into a slice
+func scanSlice(rows *sql.Rows, dest interface{}) error {
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("dest must be a pointer to slice")
+	}
+
+	sliceVal := rv.Elem()
+	elemType := sliceVal.Type().Elem()
+	isPtr := elemType.Kind() == reflect.Ptr
+	if isPtr {
+		elemType = elemType.Elem()
+	}
+
+	for rows.Next() {
+		elem := reflect.New(elemType).Elem()
+		fields := make([]interface{}, elem.NumField())
+		for i := 0; i < elem.NumField(); i++ {
+			fields[i] = elem.Field(i).Addr().Interface()
+		}
+
+		if err := rows.Scan(fields...); err != nil {
+			return err
+		}
+
+		if isPtr {
+			sliceVal.Set(reflect.Append(sliceVal, elem.Addr()))
+		} else {
+			sliceVal.Set(reflect.Append(sliceVal, elem))
+		}
+	}
+
+	return rows.Err()
+}
