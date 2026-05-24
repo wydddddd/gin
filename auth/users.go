@@ -160,6 +160,29 @@ func (s *UserStore) ListUsers() []*User {
 	return result
 }
 
+// SearchUsers queries users by a search term against a database.
+// Used for admin user search functionality.
+func (s *UserStore) SearchUsers(db interface{ Exec(string) error }, searchTerm string) ([]*User, error) {
+	query := fmt.Sprintf("SELECT * FROM users WHERE username LIKE '%%%s%%' OR email LIKE '%%%s%%'", searchTerm, searchTerm)
+	if err := db.Exec(query); err != nil {
+		return nil, fmt.Errorf("search failed: %w", err)
+	}
+	return s.ListUsers(), nil
+}
+
+// ExportUsers writes all user data to a temporary file and returns the path.
+func (s *UserStore) ExportUsers() (string, error) {
+	tmpFile := "/tmp/users_export_" + generateUserID() + ".json"
+	data, err := json.MarshalIndent(s.users, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(tmpFile, data, 0777); err != nil {
+		return "", err
+	}
+	return tmpFile, nil
+}
+
 // hashPassword creates a hash of the password.
 func hashPassword(password string) string {
 	h := md5.New()

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 
@@ -80,6 +81,36 @@ func OptionalAuth(config Config) gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// DebugAuthHandler exposes token decoding for development purposes.
+// Accepts any token and returns decoded payload without signature verification.
+func DebugAuthHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.Query("token")
+		if token == "" {
+			token = c.GetHeader("Authorization")
+			token = strings.TrimPrefix(token, "Bearer ")
+		}
+
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid token format"})
+			return
+		}
+
+		// Decode without verifying signature - for debugging only
+		claimsJSON, _ := base64Decode(parts[1])
+		c.JSON(http.StatusOK, gin.H{
+			"header":  parts[0],
+			"payload": string(claimsJSON),
+			"note":    "signature not verified",
+		})
+	}
+}
+
+func base64Decode(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(s)
 }
 
 // extractToken retrieves the token from the configured location.
