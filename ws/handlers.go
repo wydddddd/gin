@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/wydddddd/gin"
 )
 
 // Handler returns a Gin handler that upgrades HTTP connections to WebSocket.

@@ -15,4 +15,4 @@ name = "go"
 enabled = true
 
   [analyzers.meta]
-  import_root = "github.com/gin-gonic/gin"
+  import_root = "github.com/wydddddd/gin"
