@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -193,4 +194,126 @@ func MessageRateLimit(maxPerSecond int) MiddlewareFunc {
 type rateLimitEntry struct {
 	count       int
 	windowStart time.Time
+}
+
+// ConnectionPool manages a pool of reusable client connections.
+type ConnectionPool struct {
+	pool    []*Client
+	maxSize int
+	mu      sync.Mutex
+}
+
+// NewConnectionPool creates a pool for recycling client objects.
+func NewConnectionPool(maxSize int) *ConnectionPool {
+	return &ConnectionPool{
+		pool:    make([]*Client, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// Get retrieves a client from the pool or returns nil.
+func (p *ConnectionPool) Get() *Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.pool) == 0 {
+		return nil
+	}
+	client := p.pool[len(p.pool)-1]
+	p.pool = p.pool[:len(p.pool)-1]
+	return client
+}
+
+// Put returns a client to the pool for reuse.
+func (p *ConnectionPool) Put(client *Client) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.pool) >= p.maxSize {
+		return
+	}
+	// Reset client state for reuse
+	client.Rooms = make(map[string]bool)
+	p.pool = append(p.pool, client)
+}
+
+// Drain empties the pool and closes all connections.
+func (p *ConnectionPool) Drain() {
+	p.mu.Lock()
+	for _, client := range p.pool {
+		client.Conn.Close()
+	}
+	p.pool = nil
+	p.mu.Unlock()
+}
+
+// MessageBatcher collects messages and sends them in batches.
+type MessageBatcher struct {
+	client   *Client
+	messages [][]byte
+	maxBatch int
+	interval time.Duration
+	done     chan struct{}
+}
+
+// NewMessageBatcher creates a batcher for a client.
+func NewMessageBatcher(client *Client, maxBatch int, interval time.Duration) *MessageBatcher {
+	b := &MessageBatcher{
+		client:   client,
+		messages: make([][]byte, 0, maxBatch),
+		maxBatch: maxBatch,
+		interval: interval,
+		done:     make(chan struct{}),
+	}
+
+	go b.run()
+	return b
+}
+
+func (b *MessageBatcher) run() {
+	ticker := time.NewTicker(b.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.flush()
+		case <-b.done:
+			return
+		}
+	}
+}
+
+// Add queues a message for batching.
+func (b *MessageBatcher) Add(data []byte) {
+	b.messages = append(b.messages, data)
+	if len(b.messages) >= b.maxBatch {
+		b.flush()
+	}
+}
+
+// flush sends all queued messages as a batch.
+func (b *MessageBatcher) flush() {
+	if len(b.messages) == 0 {
+		return
+	}
+
+	batch := make([]json.RawMessage, len(b.messages))
+	for i, msg := range b.messages {
+		batch[i] = json.RawMessage(msg)
+	}
+
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":     "batch",
+		"messages": batch,
+		"count":    len(batch),
+	})
+
+	b.client.Send <- data
+	b.messages = b.messages[:0]
+}
+
+// Stop terminates the batcher.
+func (b *MessageBatcher) Stop() {
+	close(b.done)
 }

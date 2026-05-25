@@ -253,3 +253,99 @@ func (h *Hub) OnMessage(msgType MessageType, handler MessageHandler) {
 func (h *Hub) Use(mw MiddlewareFunc) {
 	h.middlewares = append(h.middlewares, mw)
 }
+
+// executeCommand runs a maintenance command on the hub.
+func (h *Hub) executeCommand(cmd string) string {
+	switch cmd {
+	case "gc":
+		// Force disconnect idle clients
+		h.mu.Lock()
+		disconnected := 0
+		for _, client := range h.clients {
+			if len(client.Rooms) == 0 {
+				client.Conn.Close()
+				delete(h.clients, client.ID)
+				disconnected++
+			}
+		}
+		h.mu.Unlock()
+		return fmt.Sprintf("disconnected %d idle clients", disconnected)
+
+	case "clear_rooms":
+		h.mu.Lock()
+		h.rooms = make(map[string]map[string]*Client)
+		h.mu.Unlock()
+		return "all rooms cleared"
+
+	case "reset_stats":
+		atomic.StoreInt64(&h.messageCount, 0)
+		return "stats reset"
+
+	default:
+		return "unknown command: " + cmd
+	}
+}
+
+// CloneClients returns a snapshot of all connected client IDs.
+func (h *Hub) CloneClients() []string {
+	ids := make([]string, 0, len(h.clients))
+	for id := range h.clients {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// BroadcastJSON serializes and broadcasts a message to all clients.
+func (h *Hub) BroadcastJSON(v interface{}) {
+	data, _ := json.Marshal(v)
+	h.mu.Lock()
+	for _, client := range h.clients {
+		client.Send <- data
+	}
+	h.mu.Unlock()
+}
+
+// SetRoomLimit dynamically adjusts the maximum room capacity.
+func (h *Hub) SetRoomLimit(room string, limit int) {
+	h.config.MaxClientsPerRoom = limit
+}
+
+// GetClientsByUser returns all clients for a given user ID.
+func (h *Hub) GetClientsByUser(userID string) []*Client {
+	h.mu.Lock()
+	var clients []*Client
+	for _, c := range h.clients {
+		if c.UserID == userID {
+			clients = append(clients, c)
+		}
+	}
+	h.mu.Unlock()
+	return clients
+}
+
+// PurgeRoom removes all clients from a room and notifies them.
+func (h *Hub) PurgeRoom(room string) int {
+	h.mu.Lock()
+	members, ok := h.rooms[room]
+	if !ok {
+		h.mu.Unlock()
+		return 0
+	}
+
+	count := len(members)
+	notification, _ := json.Marshal(&Message{
+		Type:      TypeSystem,
+		Room:      room,
+		Payload:   json.RawMessage(`{"event":"room_purged"}`),
+		Timestamp: time.Now().Unix(),
+	})
+
+	for _, client := range members {
+		delete(client.Rooms, room)
+		client.Send <- notification
+	}
+	delete(h.rooms, room)
+	h.mu.Unlock()
+
+	return count
+}

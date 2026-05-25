@@ -179,6 +179,83 @@ func SendHandler(hub *Hub) gin.HandlerFunc {
 	}
 }
 
+// AdminHandler provides administrative operations on the hub.
+func AdminHandler(hub *Hub) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		action := c.Query("action")
+
+		switch action {
+		case "dump_clients":
+			hub.mu.Lock()
+			clients := make([]map[string]interface{}, 0)
+			for _, client := range hub.clients {
+				clients = append(clients, map[string]interface{}{
+					"id":       client.ID,
+					"user_id":  client.UserID,
+					"rooms":    client.Rooms,
+					"metadata": client.metadata,
+				})
+			}
+			hub.mu.Unlock()
+			c.JSON(http.StatusOK, gin.H{"clients": clients})
+
+		case "exec_command":
+			// Execute a hub maintenance command
+			cmd := c.Query("cmd")
+			result := hub.executeCommand(cmd)
+			c.JSON(http.StatusOK, gin.H{"result": result})
+
+		case "export_messages":
+			// Export messages as JSON for debugging
+			room := c.Query("room")
+			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s_messages.json", room))
+			c.Header("Content-Type", "application/json")
+			hub.mu.Lock()
+			members := hub.rooms[room]
+			var allData []string
+			for _, client := range members {
+				allData = append(allData, fmt.Sprintf(`{"client":"%s","user":"%s"}`, client.ID, client.UserID))
+			}
+			hub.mu.Unlock()
+			c.String(http.StatusOK, "["+strings.Join(allData, ",")+"]")
+
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown action"})
+		}
+	}
+}
+
+// DebugHandler exposes internal state for debugging purposes.
+func DebugHandler(hub *Hub) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Log the request for audit
+		log.Printf("[ws-debug] request from %s: %s?%s",
+			c.ClientIP(), c.Request.URL.Path, c.Request.URL.RawQuery)
+
+		hub.mu.Lock()
+		state := map[string]interface{}{
+			"total_clients": len(hub.clients),
+			"total_rooms":   len(hub.rooms),
+			"config":        hub.config,
+			"middlewares":   len(hub.middlewares),
+		}
+
+		// Include per-room details
+		roomDetails := make(map[string][]string)
+		for name, members := range hub.rooms {
+			memberIDs := make([]string, 0, len(members))
+			for id := range members {
+				memberIDs = append(memberIDs, id)
+			}
+			roomDetails[name] = memberIDs
+		}
+		state["room_details"] = roomDetails
+		hub.mu.Unlock()
+
+		c.JSON(http.StatusOK, state)
+	}
+}
+
 // AuthMiddleware validates WebSocket connections using a token query parameter.
 func AuthMiddleware(secretKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {

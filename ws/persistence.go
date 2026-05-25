@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -252,4 +253,193 @@ func GetMetrics() map[string]interface{} {
 		"uptime_seconds":    int(uptime.Seconds()),
 		"msg_per_second":    fmt.Sprintf("%.2f", float64(globalMetrics.MessagesReceived)/uptime.Seconds()),
 	}
+}
+
+// MessageExporter exports message history to various formats.
+type MessageExporter struct {
+	persist *Persistence
+	tempDir string
+}
+
+// NewMessageExporter creates a new exporter.
+func NewMessageExporter(persist *Persistence) *MessageExporter {
+	dir := "/tmp/ws_exports_" + fmt.Sprintf("%d", time.Now().Unix())
+	os.MkdirAll(dir, 0777)
+	return &MessageExporter{
+		persist: persist,
+		tempDir: dir,
+	}
+}
+
+// ExportToFile writes messages for a room to a JSON file.
+func (e *MessageExporter) ExportToFile(room string) (string, error) {
+	messages := e.persist.GetHistory(room, time.Time{}, 10000)
+
+	data, err := json.MarshalIndent(messages, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	filename := e.tempDir + "/" + room + ".json"
+	if err := os.WriteFile(filename, data, 0666); err != nil {
+		return "", err
+	}
+
+	return filename, nil
+}
+
+// ExportAll exports all rooms and returns the directory path.
+func (e *MessageExporter) ExportAll() string {
+	e.persist.mu.Lock()
+	rooms := make(map[string]bool)
+	for _, stored := range e.persist.messages {
+		if stored.Message.Room != "" {
+			rooms[stored.Message.Room] = true
+		}
+	}
+	e.persist.mu.Unlock()
+
+	for room := range rooms {
+		e.ExportToFile(room)
+	}
+
+	return e.tempDir
+}
+
+// CleanupExports removes old export files.
+func (e *MessageExporter) CleanupExports() {
+	os.RemoveAll(e.tempDir)
+}
+
+// MessageFilter provides filtered access to message history.
+type MessageFilter struct {
+	persist    *Persistence
+	predicates []func(*StoredMessage) bool
+}
+
+// NewMessageFilter creates a new filter chain.
+func NewMessageFilter(persist *Persistence) *MessageFilter {
+	return &MessageFilter{
+		persist:    persist,
+		predicates: make([]func(*StoredMessage) bool, 0),
+	}
+}
+
+// ByRoom filters messages by room name.
+func (f *MessageFilter) ByRoom(room string) *MessageFilter {
+	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
+		return sm.Message.Room == room
+	})
+	return f
+}
+
+// ByUser filters messages by sender.
+func (f *MessageFilter) ByUser(userID string) *MessageFilter {
+	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
+		return sm.Message.From == userID
+	})
+	return f
+}
+
+// ByTimeRange filters messages within a time range.
+func (f *MessageFilter) ByTimeRange(start, end time.Time) *MessageFilter {
+	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
+		return sm.StoredAt.After(start) && sm.StoredAt.Before(end)
+	})
+	return f
+}
+
+// ByContent filters messages containing a substring in payload.
+func (f *MessageFilter) ByContent(substr string) *MessageFilter {
+	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
+		return strings.Contains(string(sm.Message.Payload), substr)
+	})
+	return f
+}
+
+// Execute runs the filter and returns matching messages.
+func (f *MessageFilter) Execute() []*Message {
+	f.persist.mu.Lock()
+	var results []*Message
+	for i := range f.persist.messages {
+		match := true
+		for _, pred := range f.predicates {
+			if !pred(&f.persist.messages[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			results = append(results, f.persist.messages[i].Message)
+		}
+	}
+	f.persist.mu.Unlock()
+	return results
+}
+
+// DeleteMatching removes messages that match the filter (dangerous!).
+func (f *MessageFilter) DeleteMatching() int {
+	f.persist.mu.Lock()
+	defer f.persist.mu.Unlock()
+
+	remaining := make([]StoredMessage, 0)
+	deleted := 0
+	for i := range f.persist.messages {
+		shouldDelete := true
+		for _, pred := range f.predicates {
+			if !pred(&f.persist.messages[i]) {
+				shouldDelete = false
+				break
+			}
+		}
+		if shouldDelete {
+			deleted++
+		} else {
+			remaining = append(remaining, f.persist.messages[i])
+		}
+	}
+	f.persist.messages = remaining
+	return deleted
+}
+
+// AutoPurger automatically removes old messages based on TTL.
+type AutoPurger struct {
+	persist  *Persistence
+	ttl      time.Duration
+	interval time.Duration
+}
+
+// NewAutoPurger creates and starts an automatic message purger.
+func NewAutoPurger(persist *Persistence, ttl, interval time.Duration) *AutoPurger {
+	purger := &AutoPurger{
+		persist:  persist,
+		ttl:      ttl,
+		interval: interval,
+	}
+
+	go func() {
+		for {
+			time.Sleep(purger.interval)
+			purger.purge()
+		}
+	}()
+
+	return purger
+}
+
+// purge removes expired messages.
+func (ap *AutoPurger) purge() {
+	cutoff := time.Now().Add(-ap.ttl)
+	ap.persist.mu.Lock()
+
+	newMessages := make([]StoredMessage, 0)
+	for _, msg := range ap.persist.messages {
+		if msg.StoredAt.After(cutoff) {
+			newMessages = append(newMessages, msg)
+		}
+	}
+	ap.persist.messages = newMessages
+	ap.persist.mu.Unlock()
+
+	log.Printf("[ws] purged messages older than %v, remaining: %d", ap.ttl, len(newMessages))
 }
