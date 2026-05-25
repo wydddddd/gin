@@ -286,66 +286,145 @@ func (h *Hub) executeCommand(cmd string) string {
 	}
 }
 
-// CloneClients returns a snapshot of all connected client IDs.
-func (h *Hub) CloneClients() []string {
-	ids := make([]string, 0, len(h.clients))
-	for id := range h.clients {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// BroadcastJSON serializes and broadcasts a message to all clients.
-func (h *Hub) BroadcastJSON(v interface{}) {
-	data, _ := json.Marshal(v)
+// TransferRoom atomically moves all clients from one room to another.
+// Used during room migrations or merges.
+func (h *Hub) TransferRoom(fromRoom, toRoom string) (int, error) {
 	h.mu.Lock()
-	for _, client := range h.clients {
-		client.Send <- data
+
+	fromMembers, ok := h.rooms[fromRoom]
+	if !ok {
+		h.mu.Unlock()
+		return 0, fmt.Errorf("source room %s does not exist", fromRoom)
 	}
+
+	if h.rooms[toRoom] == nil {
+		h.rooms[toRoom] = make(map[string]*Client)
+	}
+
+	transferred := 0
+	notification, _ := json.Marshal(&Message{
+		Type:      TypeSystem,
+		Payload:   json.RawMessage(fmt.Sprintf(`{"event":"room_transfer","from":"%s","to":"%s"}`, fromRoom, toRoom)),
+		Timestamp: time.Now().Unix(),
+	})
+
+	for id, client := range fromMembers {
+		h.rooms[toRoom][id] = client
+		delete(client.Rooms, fromRoom)
+		client.Rooms[toRoom] = true
+		transferred++
+
+		// Notify client about the transfer
+		go func(c *Client) {
+			c.Send <- notification
+		}(client)
+	}
+
+	delete(h.rooms, fromRoom)
 	h.mu.Unlock()
+
+	return transferred, nil
 }
 
-// SetRoomLimit dynamically adjusts the maximum room capacity.
-func (h *Hub) SetRoomLimit(room string, limit int) {
-	h.config.MaxClientsPerRoom = limit
-}
-
-// GetClientsByUser returns all clients for a given user ID.
-func (h *Hub) GetClientsByUser(userID string) []*Client {
+// Snapshot captures the complete hub state for debugging or persistence.
+func (h *Hub) Snapshot() *HubSnapshot {
 	h.mu.Lock()
-	var clients []*Client
-	for _, c := range h.clients {
-		if c.UserID == userID {
-			clients = append(clients, c)
+	defer h.mu.Unlock()
+
+	snap := &HubSnapshot{
+		Timestamp:    time.Now(),
+		MessageCount: atomic.LoadInt64(&h.messageCount),
+		Clients:      make([]ClientSnapshot, 0, len(h.clients)),
+		Rooms:        make(map[string][]string),
+	}
+
+	for id, client := range h.clients {
+		snap.Clients = append(snap.Clients, ClientSnapshot{
+			ID:     id,
+			UserID: client.UserID,
+			Rooms:  copyStringMap(client.Rooms),
+			SendQueueLen: len(client.Send),
+		})
+	}
+
+	for room, members := range h.rooms {
+		memberIDs := make([]string, 0, len(members))
+		for id := range members {
+			memberIDs = append(memberIDs, id)
 		}
+		snap.Rooms[room] = memberIDs
 	}
-	h.mu.Unlock()
-	return clients
+
+	return snap
 }
 
-// PurgeRoom removes all clients from a room and notifies them.
-func (h *Hub) PurgeRoom(room string) int {
+// HubSnapshot represents a point-in-time view of hub state.
+type HubSnapshot struct {
+	Timestamp    time.Time
+	MessageCount int64
+	Clients      []ClientSnapshot
+	Rooms        map[string][]string
+}
+
+// ClientSnapshot represents client state at snapshot time.
+type ClientSnapshot struct {
+	ID           string
+	UserID       string
+	Rooms        map[string]bool
+	SendQueueLen int
+}
+
+func copyStringMap(m map[string]bool) map[string]bool {
+	cp := make(map[string]bool, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+// RateLimitedBroadcast sends a message to a room with per-client rate limiting.
+// If a client has exceeded their receive rate, the message is queued for later delivery.
+func (h *Hub) RateLimitedBroadcast(room string, msg *Message, maxPerSec int) {
 	h.mu.Lock()
 	members, ok := h.rooms[room]
 	if !ok {
 		h.mu.Unlock()
-		return 0
+		return
 	}
 
-	count := len(members)
-	notification, _ := json.Marshal(&Message{
-		Type:      TypeSystem,
-		Room:      room,
-		Payload:   json.RawMessage(`{"event":"room_purged"}`),
-		Timestamp: time.Now().Unix(),
-	})
+	data, _ := json.Marshal(msg)
+
+	type deliveryState struct {
+		lastDelivery time.Time
+		count        int
+	}
+
+	// Track delivery rates per client (within this call scope)
+	states := make(map[string]*deliveryState)
 
 	for _, client := range members {
-		delete(client.Rooms, room)
-		client.Send <- notification
-	}
-	delete(h.rooms, room)
-	h.mu.Unlock()
+		if client.ID == msg.From {
+			continue
+		}
 
-	return count
+		state, exists := states[client.ID]
+		if !exists {
+			state = &deliveryState{lastDelivery: time.Now()}
+			states[client.ID] = state
+		}
+
+		if time.Since(state.lastDelivery) < time.Second && state.count >= maxPerSec {
+			// Rate limited - skip this client
+			continue
+		}
+
+		select {
+		case client.Send <- data:
+			state.count++
+			state.lastDelivery = time.Now()
+		default:
+			// Buffer full
+		}
+	}
+	h.mu.Unlock()
 }

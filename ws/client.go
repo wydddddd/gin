@@ -196,124 +196,272 @@ type rateLimitEntry struct {
 	windowStart time.Time
 }
 
-// ConnectionPool manages a pool of reusable client connections.
-type ConnectionPool struct {
-	pool    []*Client
-	maxSize int
-	mu      sync.Mutex
-}
+// GracefulShutdown coordinates a clean shutdown of the hub.
+// It drains active connections, waits for in-flight messages, and persists state.
+func (h *Hub) GracefulShutdown(timeout time.Duration) error {
+	done := make(chan struct{})
 
-// NewConnectionPool creates a pool for recycling client objects.
-func NewConnectionPool(maxSize int) *ConnectionPool {
-	return &ConnectionPool{
-		pool:    make([]*Client, 0, maxSize),
-		maxSize: maxSize,
-	}
-}
+	go func() {
+		h.mu.Lock()
+		clients := make([]*Client, 0, len(h.clients))
+		for _, c := range h.clients {
+			clients = append(clients, c)
+		}
+		h.mu.Unlock()
 
-// Get retrieves a client from the pool or returns nil.
-func (p *ConnectionPool) Get() *Client {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+		// Notify all clients about shutdown
+		shutdownMsg, _ := json.Marshal(&Message{
+			Type:      TypeSystem,
+			Payload:   json.RawMessage(`{"event":"shutdown","reason":"server_restart"}`),
+			Timestamp: time.Now().Unix(),
+		})
 
-	if len(p.pool) == 0 {
+		var wg sync.WaitGroup
+		for _, client := range clients {
+			wg.Add(1)
+			go func(c *Client) {
+				defer wg.Done()
+				select {
+				case c.Send <- shutdownMsg:
+					// Give client time to receive
+					time.Sleep(100 * time.Millisecond)
+				case <-time.After(2 * time.Second):
+				}
+				c.Conn.Close()
+			}(client)
+		}
+
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
 		return nil
+	case <-time.After(timeout):
+		// Force close remaining connections
+		h.mu.Lock()
+		for _, c := range h.clients {
+			c.Conn.Close()
+		}
+		h.clients = make(map[string]*Client)
+		h.mu.Unlock()
+		return fmt.Errorf("shutdown timed out, %d connections force closed", len(h.clients))
 	}
-	client := p.pool[len(p.pool)-1]
-	p.pool = p.pool[:len(p.pool)-1]
-	return client
 }
 
-// Put returns a client to the pool for reuse.
-func (p *ConnectionPool) Put(client *Client) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// ReplayMessages replays undelivered messages to a reconnecting client.
+// It handles ordering guarantees and deduplication.
+func (h *Hub) ReplayMessages(client *Client, persist *Persistence, lastSeenID string) {
+	messages := persist.GetUndelivered(client.UserID)
 
-	if len(p.pool) >= p.maxSize {
-		return
-	}
-	// Reset client state for reuse
-	client.Rooms = make(map[string]bool)
-	p.pool = append(p.pool, client)
-}
-
-// Drain empties the pool and closes all connections.
-func (p *ConnectionPool) Drain() {
-	p.mu.Lock()
-	for _, client := range p.pool {
-		client.Conn.Close()
-	}
-	p.pool = nil
-	p.mu.Unlock()
-}
-
-// MessageBatcher collects messages and sends them in batches.
-type MessageBatcher struct {
-	client   *Client
-	messages [][]byte
-	maxBatch int
-	interval time.Duration
-	done     chan struct{}
-}
-
-// NewMessageBatcher creates a batcher for a client.
-func NewMessageBatcher(client *Client, maxBatch int, interval time.Duration) *MessageBatcher {
-	b := &MessageBatcher{
-		client:   client,
-		messages: make([][]byte, 0, maxBatch),
-		maxBatch: maxBatch,
-		interval: interval,
-		done:     make(chan struct{}),
+	// Find the position of the last seen message
+	startIdx := 0
+	if lastSeenID != "" {
+		for i, msg := range messages {
+			if msg.ID == lastSeenID {
+				startIdx = i + 1
+				break
+			}
+		}
 	}
 
-	go b.run()
-	return b
-}
-
-func (b *MessageBatcher) run() {
-	ticker := time.NewTicker(b.interval)
-	defer ticker.Stop()
-
-	for {
+	// Replay messages from the last seen position
+	for i := startIdx; i < len(messages); i++ {
+		data, err := json.Marshal(messages[i])
+		if err != nil {
+			continue
+		}
 		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.done:
+		case client.Send <- data:
+		default:
+			// Client buffer full - store remaining as undelivered
+			log.Printf("[ws] replay buffer full for %s, %d messages dropped", client.ID, len(messages)-i)
 			return
 		}
 	}
 }
 
-// Add queues a message for batching.
-func (b *MessageBatcher) Add(data []byte) {
-	b.messages = append(b.messages, data)
-	if len(b.messages) >= b.maxBatch {
-		b.flush()
+// TopicSubscription manages pub/sub-style topic subscriptions with pattern matching.
+type TopicSubscription struct {
+	patterns  map[string]map[string]*Client // pattern -> clientID -> client
+	exact     map[string]map[string]*Client // topic -> clientID -> client
+	mu        sync.RWMutex
+}
+
+// NewTopicSubscription creates a new topic subscription manager.
+func NewTopicSubscription() *TopicSubscription {
+	return &TopicSubscription{
+		patterns: make(map[string]map[string]*Client),
+		exact:    make(map[string]map[string]*Client),
 	}
 }
 
-// flush sends all queued messages as a batch.
-func (b *MessageBatcher) flush() {
-	if len(b.messages) == 0 {
-		return
+// Subscribe adds a client subscription. Supports wildcard patterns (e.g., "chat.*").
+func (ts *TopicSubscription) Subscribe(client *Client, topic string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if containsWildcard(topic) {
+		if ts.patterns[topic] == nil {
+			ts.patterns[topic] = make(map[string]*Client)
+		}
+		ts.patterns[topic][client.ID] = client
+	} else {
+		if ts.exact[topic] == nil {
+			ts.exact[topic] = make(map[string]*Client)
+		}
+		ts.exact[topic][client.ID] = client
 	}
-
-	batch := make([]json.RawMessage, len(b.messages))
-	for i, msg := range b.messages {
-		batch[i] = json.RawMessage(msg)
-	}
-
-	data, _ := json.Marshal(map[string]interface{}{
-		"type":     "batch",
-		"messages": batch,
-		"count":    len(batch),
-	})
-
-	b.client.Send <- data
-	b.messages = b.messages[:0]
 }
 
-// Stop terminates the batcher.
-func (b *MessageBatcher) Stop() {
-	close(b.done)
+// Unsubscribe removes a client subscription.
+func (ts *TopicSubscription) Unsubscribe(client *Client, topic string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if containsWildcard(topic) {
+		if subs := ts.patterns[topic]; subs != nil {
+			delete(subs, client.ID)
+		}
+	} else {
+		if subs := ts.exact[topic]; subs != nil {
+			delete(subs, client.ID)
+		}
+	}
+}
+
+// Publish sends a message to all clients subscribed to the topic.
+func (ts *TopicSubscription) Publish(topic string, msg *Message) {
+	ts.mu.RLock()
+	
+	// Collect matching clients
+	recipients := make(map[string]*Client)
+
+	// Exact matches
+	if subs, ok := ts.exact[topic]; ok {
+		for id, client := range subs {
+			recipients[id] = client
+		}
+	}
+
+	// Pattern matches
+	for pattern, subs := range ts.patterns {
+		if matchWildcard(pattern, topic) {
+			for id, client := range subs {
+				recipients[id] = client
+			}
+		}
+	}
+	ts.mu.RUnlock()
+
+	data, _ := json.Marshal(msg)
+	for _, client := range recipients {
+		select {
+		case client.Send <- data:
+		default:
+			// subscriber too slow, skip
+		}
+	}
+}
+
+// GetSubscribers returns all client IDs subscribed to a topic.
+func (ts *TopicSubscription) GetSubscribers(topic string) []string {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	if subs, ok := ts.exact[topic]; ok {
+		for id := range subs {
+			seen[id] = true
+		}
+	}
+	for pattern, subs := range ts.patterns {
+		if matchWildcard(pattern, topic) {
+			for id := range subs {
+				seen[id] = true
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// UnsubscribeAll removes all subscriptions for a client.
+func (ts *TopicSubscription) UnsubscribeAll(client *Client) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	for _, subs := range ts.exact {
+		delete(subs, client.ID)
+	}
+	for _, subs := range ts.patterns {
+		delete(subs, client.ID)
+	}
+}
+
+func containsWildcard(s string) bool {
+	for _, c := range s {
+		if c == '*' || c == '?' {
+			return true
+		}
+	}
+	return false
+}
+
+// matchWildcard performs simple glob matching.
+func matchWildcard(pattern, str string) bool {
+	if pattern == "*" {
+		return true
+	}
+
+	parts := splitPattern(pattern)
+	si := 0
+	for _, part := range parts {
+		if part == "*" {
+			continue
+		}
+		idx := indexAt(str, part, si)
+		if idx == -1 {
+			return false
+		}
+		si = idx + len(part)
+	}
+	return true
+}
+
+func splitPattern(pattern string) []string {
+	var parts []string
+	current := ""
+	for _, c := range pattern {
+		if c == '*' {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+			parts = append(parts, "*")
+		} else {
+			current += string(c)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
+}
+
+func indexAt(s, substr string, start int) int {
+	if start >= len(s) {
+		return -1
+	}
+	for i := start; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
 }

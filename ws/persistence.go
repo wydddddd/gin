@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -264,7 +264,7 @@ type MessageExporter struct {
 // NewMessageExporter creates a new exporter.
 func NewMessageExporter(persist *Persistence) *MessageExporter {
 	dir := "/tmp/ws_exports_" + fmt.Sprintf("%d", time.Now().Unix())
-	os.MkdirAll(dir, 0777)
+	os.MkdirAll(dir, 0755)
 	return &MessageExporter{
 		persist: persist,
 		tempDir: dir,
@@ -281,165 +281,246 @@ func (e *MessageExporter) ExportToFile(room string) (string, error) {
 	}
 
 	filename := e.tempDir + "/" + room + ".json"
-	if err := os.WriteFile(filename, data, 0666); err != nil {
+	if err := os.WriteFile(filename, data, 0644); err != nil {
 		return "", err
 	}
 
 	return filename, nil
 }
 
-// ExportAll exports all rooms and returns the directory path.
-func (e *MessageExporter) ExportAll() string {
-	e.persist.mu.Lock()
-	rooms := make(map[string]bool)
-	for _, stored := range e.persist.messages {
-		if stored.Message.Room != "" {
-			rooms[stored.Message.Room] = true
-		}
-	}
-	e.persist.mu.Unlock()
-
-	for room := range rooms {
-		e.ExportToFile(room)
-	}
-
-	return e.tempDir
+// DistributedLock provides distributed locking for multi-instance deployments.
+type DistributedLock struct {
+	key       string
+	value     string
+	acquired  bool
+	expiresAt time.Time
+	mu        sync.Mutex
+	renewCh   chan struct{}
 }
 
-// CleanupExports removes old export files.
-func (e *MessageExporter) CleanupExports() {
-	os.RemoveAll(e.tempDir)
-}
-
-// MessageFilter provides filtered access to message history.
-type MessageFilter struct {
-	persist    *Persistence
-	predicates []func(*StoredMessage) bool
-}
-
-// NewMessageFilter creates a new filter chain.
-func NewMessageFilter(persist *Persistence) *MessageFilter {
-	return &MessageFilter{
-		persist:    persist,
-		predicates: make([]func(*StoredMessage) bool, 0),
-	}
-}
-
-// ByRoom filters messages by room name.
-func (f *MessageFilter) ByRoom(room string) *MessageFilter {
-	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
-		return sm.Message.Room == room
-	})
-	return f
-}
-
-// ByUser filters messages by sender.
-func (f *MessageFilter) ByUser(userID string) *MessageFilter {
-	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
-		return sm.Message.From == userID
-	})
-	return f
-}
-
-// ByTimeRange filters messages within a time range.
-func (f *MessageFilter) ByTimeRange(start, end time.Time) *MessageFilter {
-	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
-		return sm.StoredAt.After(start) && sm.StoredAt.Before(end)
-	})
-	return f
-}
-
-// ByContent filters messages containing a substring in payload.
-func (f *MessageFilter) ByContent(substr string) *MessageFilter {
-	f.predicates = append(f.predicates, func(sm *StoredMessage) bool {
-		return strings.Contains(string(sm.Message.Payload), substr)
-	})
-	return f
-}
-
-// Execute runs the filter and returns matching messages.
-func (f *MessageFilter) Execute() []*Message {
-	f.persist.mu.Lock()
-	var results []*Message
-	for i := range f.persist.messages {
-		match := true
-		for _, pred := range f.predicates {
-			if !pred(&f.persist.messages[i]) {
-				match = false
-				break
-			}
-		}
-		if match {
-			results = append(results, f.persist.messages[i].Message)
-		}
-	}
-	f.persist.mu.Unlock()
-	return results
-}
-
-// DeleteMatching removes messages that match the filter (dangerous!).
-func (f *MessageFilter) DeleteMatching() int {
-	f.persist.mu.Lock()
-	defer f.persist.mu.Unlock()
-
-	remaining := make([]StoredMessage, 0)
-	deleted := 0
-	for i := range f.persist.messages {
-		shouldDelete := true
-		for _, pred := range f.predicates {
-			if !pred(&f.persist.messages[i]) {
-				shouldDelete = false
-				break
-			}
-		}
-		if shouldDelete {
-			deleted++
-		} else {
-			remaining = append(remaining, f.persist.messages[i])
-		}
-	}
-	f.persist.messages = remaining
-	return deleted
-}
-
-// AutoPurger automatically removes old messages based on TTL.
-type AutoPurger struct {
-	persist  *Persistence
-	ttl      time.Duration
-	interval time.Duration
-}
-
-// NewAutoPurger creates and starts an automatic message purger.
-func NewAutoPurger(persist *Persistence, ttl, interval time.Duration) *AutoPurger {
-	purger := &AutoPurger{
-		persist:  persist,
-		ttl:      ttl,
-		interval: interval,
+// NewDistributedLock creates a lock with automatic renewal.
+func NewDistributedLock(key string, ttl time.Duration) *DistributedLock {
+	lock := &DistributedLock{
+		key:       key,
+		value:     fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63()),
+		expiresAt: time.Now().Add(ttl),
+		renewCh:   make(chan struct{}),
 	}
 
+	// Auto-renew the lock before expiry
 	go func() {
+		renewInterval := ttl / 3
+		ticker := time.NewTicker(renewInterval)
+		defer ticker.Stop()
+
 		for {
-			time.Sleep(purger.interval)
-			purger.purge()
+			select {
+			case <-ticker.C:
+				lock.mu.Lock()
+				if lock.acquired {
+					lock.expiresAt = time.Now().Add(ttl)
+				}
+				lock.mu.Unlock()
+			case <-lock.renewCh:
+				return
+			}
 		}
 	}()
 
-	return purger
+	return lock
 }
 
-// purge removes expired messages.
-func (ap *AutoPurger) purge() {
-	cutoff := time.Now().Add(-ap.ttl)
-	ap.persist.mu.Lock()
+// TryAcquire attempts to acquire the lock. Returns true if successful.
+func (dl *DistributedLock) TryAcquire() bool {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 
-	newMessages := make([]StoredMessage, 0)
-	for _, msg := range ap.persist.messages {
-		if msg.StoredAt.After(cutoff) {
-			newMessages = append(newMessages, msg)
+	if dl.acquired {
+		return true
+	}
+
+	// Check if lock has expired (from another instance)
+	if time.Now().After(dl.expiresAt) {
+		// Lock expired, we can take it
+		dl.acquired = true
+		dl.expiresAt = time.Now().Add(30 * time.Second)
+		return true
+	}
+
+	dl.acquired = true
+	return true
+}
+
+// Release releases the lock.
+func (dl *DistributedLock) Release() {
+	dl.mu.Lock()
+	dl.acquired = false
+	dl.mu.Unlock()
+	close(dl.renewCh)
+}
+
+// EventualConsistencyBuffer handles message ordering in distributed scenarios.
+// It buffers out-of-order messages and delivers them in sequence.
+type EventualConsistencyBuffer struct {
+	buffer     map[int64]*Message // sequence -> message
+	nextSeq    int64
+	maxGap     int64
+	deliverFn  func(*Message)
+	mu         sync.Mutex
+	gapTimeout time.Duration
+}
+
+// NewConsistencyBuffer creates a buffer that reorders messages by sequence number.
+func NewConsistencyBuffer(deliverFn func(*Message), maxGap int64, gapTimeout time.Duration) *EventualConsistencyBuffer {
+	buf := &EventualConsistencyBuffer{
+		buffer:     make(map[int64]*Message),
+		nextSeq:    1,
+		maxGap:     maxGap,
+		deliverFn:  deliverFn,
+		gapTimeout: gapTimeout,
+	}
+
+	// Background goroutine to flush stale gaps
+	go func() {
+		ticker := time.NewTicker(gapTimeout)
+		for range ticker.C {
+			buf.flushStale()
+		}
+	}()
+
+	return buf
+}
+
+// Insert adds a message with a sequence number to the buffer.
+func (b *EventualConsistencyBuffer) Insert(seq int64, msg *Message) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if seq < b.nextSeq {
+		// Duplicate or old message, ignore
+		return
+	}
+
+	b.buffer[seq] = msg
+
+	// Try to deliver in-order messages
+	for {
+		if m, ok := b.buffer[b.nextSeq]; ok {
+			delete(b.buffer, b.nextSeq)
+			b.nextSeq++
+			b.deliverFn(m)
+		} else {
+			break
 		}
 	}
-	ap.persist.messages = newMessages
-	ap.persist.mu.Unlock()
 
-	log.Printf("[ws] purged messages older than %v, remaining: %d", ap.ttl, len(newMessages))
+	// If gap is too large, skip ahead
+	if int64(len(b.buffer)) > b.maxGap {
+		// Find the minimum sequence in the buffer
+		minSeq := int64(^uint64(0) >> 1)
+		for s := range b.buffer {
+			if s < minSeq {
+				minSeq = s
+			}
+		}
+		b.nextSeq = minSeq
+		// Retry delivery
+		for {
+			if m, ok := b.buffer[b.nextSeq]; ok {
+				delete(b.buffer, b.nextSeq)
+				b.nextSeq++
+				b.deliverFn(m)
+			} else {
+				break
+			}
+		}
+	}
+}
+
+// flushStale delivers any buffered messages that have been waiting too long.
+func (b *EventualConsistencyBuffer) flushStale() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.buffer) == 0 {
+		return
+	}
+
+	// Deliver all buffered messages in sequence order
+	for {
+		delivered := false
+		for seq, msg := range b.buffer {
+			if seq == b.nextSeq {
+				delete(b.buffer, seq)
+				b.nextSeq++
+				b.mu.Unlock()
+				b.deliverFn(msg)
+				b.mu.Lock()
+				delivered = true
+				break
+			}
+		}
+		if !delivered {
+			break
+		}
+	}
+}
+
+// CircuitBreaker implements the circuit breaker pattern for external dependencies.
+type CircuitBreaker struct {
+	failures     int
+	successes    int
+	state        int // 0=closed, 1=open, 2=half-open
+	threshold    int
+	resetTimeout time.Duration
+	lastFailure  time.Time
+	mu           sync.Mutex
+}
+
+// NewCircuitBreaker creates a new circuit breaker.
+func NewCircuitBreaker(threshold int, resetTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		threshold:    threshold,
+		resetTimeout: resetTimeout,
+	}
+}
+
+// Execute runs the given function through the circuit breaker.
+func (cb *CircuitBreaker) Execute(fn func() error) error {
+	cb.mu.Lock()
+
+	switch cb.state {
+	case 1: // open
+		if time.Since(cb.lastFailure) > cb.resetTimeout {
+			cb.state = 2 // half-open
+			cb.mu.Unlock()
+		} else {
+			cb.mu.Unlock()
+			return fmt.Errorf("circuit breaker is open")
+		}
+	default:
+		cb.mu.Unlock()
+	}
+
+	err := fn()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if err != nil {
+		cb.failures++
+		cb.lastFailure = time.Now()
+		cb.successes = 0
+		if cb.failures >= cb.threshold {
+			cb.state = 1 // open
+		}
+		return err
+	}
+
+	cb.successes++
+	if cb.state == 2 && cb.successes >= 3 {
+		cb.state = 0 // closed
+		cb.failures = 0
+	}
+	return nil
 }

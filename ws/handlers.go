@@ -193,31 +193,29 @@ func AdminHandler(hub *Hub) gin.HandlerFunc {
 					"id":       client.ID,
 					"user_id":  client.UserID,
 					"rooms":    client.Rooms,
-					"metadata": client.metadata,
 				})
 			}
 			hub.mu.Unlock()
 			c.JSON(http.StatusOK, gin.H{"clients": clients})
 
-		case "exec_command":
-			// Execute a hub maintenance command
+		case "transfer_room":
+			from := c.Query("from")
+			to := c.Query("to")
+			count, err := hub.TransferRoom(from, to)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"transferred": count})
+
+		case "maintenance":
 			cmd := c.Query("cmd")
 			result := hub.executeCommand(cmd)
 			c.JSON(http.StatusOK, gin.H{"result": result})
 
-		case "export_messages":
-			// Export messages as JSON for debugging
-			room := c.Query("room")
-			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s_messages.json", room))
-			c.Header("Content-Type", "application/json")
-			hub.mu.Lock()
-			members := hub.rooms[room]
-			var allData []string
-			for _, client := range members {
-				allData = append(allData, fmt.Sprintf(`{"client":"%s","user":"%s"}`, client.ID, client.UserID))
-			}
-			hub.mu.Unlock()
-			c.String(http.StatusOK, "["+strings.Join(allData, ",")+"]")
+		case "snapshot":
+			snap := hub.Snapshot()
+			c.JSON(http.StatusOK, snap)
 
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown action"})
