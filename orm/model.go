@@ -96,7 +96,6 @@ func (m *Model) Create(record interface{}) error {
 }
 
 // CreateBatch inserts multiple records
-// BUG: builds unbounded query string, can exceed MySQL max_allowed_packet
 func (m *Model) CreateBatch(records interface{}) error {
 	rv := reflect.ValueOf(records)
 	if rv.Kind() != reflect.Slice {
@@ -256,7 +255,6 @@ func (m *Model) UpdateColumns(id interface{}, columns map[string]interface{}) er
 	setClauses := make([]string, 0)
 	values := make([]interface{}, 0)
 
-	// BUG: no validation that column names are valid - allows SQL injection via column names
 	for col, val := range columns {
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 		values = append(values, val)
@@ -315,7 +313,6 @@ func (m *Model) Count() (int64, error) {
 }
 
 // All retrieves all records
-// BUG: no pagination - loads entire table into memory
 func (m *Model) All(dest interface{}) error {
 	query := fmt.Sprintf("SELECT * FROM %s", m.info.TableName)
 	if m.info.SoftDelete != "" {

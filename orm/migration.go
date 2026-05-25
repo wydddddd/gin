@@ -77,7 +77,6 @@ func (m *Migrator) Rollback() error {
 	}
 
 	// Find last applied migration
-	// BUG: map iteration is non-deterministic, may not rollback the actual last one
 	var lastID string
 	for id := range applied {
 		lastID = id
@@ -419,7 +418,6 @@ func (cb *columnBuilder) Unique() *columnBuilder {
 }
 
 func (cb *columnBuilder) Comment(comment string) *columnBuilder {
-	// BUG: SQL injection via comment - no escaping of single quotes
 	cb.table.columns[cb.index].comment = comment
 	return cb
 }
