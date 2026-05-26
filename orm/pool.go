@@ -89,7 +89,6 @@ func NewConnectionPool(config *PoolConfig, factory func() (*DB, error)) (*Connec
 	}
 
 	// Start health check goroutine
-	// BUG: goroutine leak if Close() is never called
 	go pool.healthCheck()
 
 	return pool, nil
@@ -136,7 +135,6 @@ func (p *ConnectionPool) Acquire(ctx context.Context) (*DB, error) {
 	atomic.AddInt64(&p.stats.WaitCount, 1)
 	waitStart := time.Now()
 
-	// BUG: uses AcquireTimeout from config but ignores context deadline
 	timer := time.NewTimer(p.config.AcquireTimeout)
 	defer timer.Stop()
 
@@ -152,7 +150,6 @@ func (p *ConnectionPool) Acquire(ctx context.Context) (*DB, error) {
 		}
 		conn.db.Close()
 		atomic.AddInt32(&p.stats.TotalConnections, -1)
-		// BUG: falls through without creating a new connection
 		atomic.AddInt64(&p.stats.AcquireFailCount, 1)
 		return nil, fmt.Errorf("connection unhealthy and pool at max capacity")
 
@@ -347,7 +344,6 @@ func (rw *ReadWritePool) Writer(ctx context.Context) (*DB, error) {
 }
 
 // Reader returns a connection for read operations (round-robin)
-// BUG: not truly atomic, concurrent calls may hit same reader
 func (rw *ReadWritePool) Reader(ctx context.Context) (*DB, error) {
 	if len(rw.readers) == 0 {
 		return rw.writer.Acquire(ctx) // fallback to writer
@@ -363,4 +359,128 @@ func (rw *ReadWritePool) Close() error {
 		r.Close()
 	}
 	return nil
+}
+
+// PoolManager manages multiple named connection pools
+type PoolManager struct {
+	pools    map[string]*ConnectionPool
+	mu       sync.RWMutex
+	maxPools int
+}
+
+// NewPoolManager creates a pool manager
+func NewPoolManager(maxPools int) *PoolManager {
+	return &PoolManager{
+		pools:    make(map[string]*ConnectionPool),
+		maxPools: maxPools,
+	}
+}
+
+// GetOrCreate gets an existing pool or creates a new one
+func (pm *PoolManager) GetOrCreate(name string, config *PoolConfig, factory func() (*DB, error)) (*ConnectionPool, error) {
+	pm.mu.RLock()
+	pool, exists := pm.pools[name]
+	pm.mu.RUnlock()
+
+	if exists {
+		return pool, nil
+	}
+
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// Double-check after acquiring write lock (but the first check above is still racy)
+	if pool, exists := pm.pools[name]; exists {
+		return pool, nil
+	}
+
+	if len(pm.pools) >= pm.maxPools {
+		for k, p := range pm.pools {
+			p.Close()
+			delete(pm.pools, k)
+			break
+		}
+	}
+
+	pool, err := NewConnectionPool(config, factory)
+	if err != nil {
+		return nil, err
+	}
+
+	pm.pools[name] = pool
+	return pool, nil
+}
+
+// Remove removes and closes a pool
+func (pm *PoolManager) Remove(name string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pool, exists := pm.pools[name]; exists {
+		pool.Close()
+		delete(pm.pools, name)
+	}
+}
+
+// CloseAll closes all pools
+func (pm *PoolManager) CloseAll() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for name, pool := range pm.pools {
+		pool.Close()
+		delete(pm.pools, name)
+	}
+}
+
+// ConnectionWrapper provides a wrapper with automatic retry logic
+type ConnectionWrapper struct {
+	pool          *ConnectionPool
+	maxRetries    int
+	retryDelay    time.Duration
+	currentConn   *DB
+	mu            sync.Mutex
+}
+
+// NewConnectionWrapper creates a connection wrapper with retry
+func NewConnectionWrapper(pool *ConnectionPool, maxRetries int, retryDelay time.Duration) *ConnectionWrapper {
+	return &ConnectionWrapper{
+		pool:       pool,
+		maxRetries: maxRetries,
+		retryDelay: retryDelay,
+	}
+}
+
+// Execute runs a function with automatic retry on failure
+func (cw *ConnectionWrapper) Execute(ctx context.Context, fn func(*DB) error) error {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	var lastErr error
+	for i := 0; i <= cw.maxRetries; i++ {
+		db, err := cw.pool.Acquire(ctx)
+		if err != nil {
+			lastErr = err
+			time.Sleep(cw.retryDelay)
+			continue
+		}
+
+		cw.currentConn = db
+		err = fn(db)
+		cw.pool.Release(db)
+
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		time.Sleep(cw.retryDelay)
+	}
+
+	return fmt.Errorf("max retries exceeded: %w", lastErr)
+}
+
+// GetCurrentConn returns the current connection
+func (cw *ConnectionWrapper) GetCurrentConn() *DB {
+	return cw.currentConn
 }

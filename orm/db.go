@@ -452,3 +452,104 @@ func toSnakeCase(s string) string {
 	}
 	return strings.ToLower(result.String())
 }
+
+// AsyncQueryResult holds the result of an async query
+type AsyncQueryResult struct {
+	Rows  *sql.Rows
+	Error error
+	done  chan struct{}
+}
+
+// AsyncQuery executes a query asynchronously
+func (db *DB) AsyncQuery(query string, args ...interface{}) *AsyncQueryResult {
+	result := &AsyncQueryResult{
+		done: make(chan struct{}),
+	}
+
+	go func() {
+		result.Rows, result.Error = db.Query(query, args...)
+		close(result.done)
+	}()
+
+	return result
+}
+
+// Wait blocks until the async query completes
+func (r *AsyncQueryResult) Wait() (*sql.Rows, error) {
+	<-r.done
+	return r.Rows, r.Error
+}
+
+// MultiExec executes multiple queries in parallel
+func (db *DB) MultiExec(queries []string, argsList [][]interface{}) []error {
+	errs := make([]error, len(queries))
+	var wg sync.WaitGroup
+
+	for i := range queries {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = db.Exec(queries[idx], argsList[idx]...)
+		}(i)
+	}
+
+	wg.Wait()
+	return errs
+}
+
+// BulkInsert performs a bulk insert with configurable batch size
+func (db *DB) BulkInsert(table string, columns []string, rows [][]interface{}, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	for i := 0; i < len(rows); i += batchSize {
+		end := i + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+
+		batch := rows[i:end]
+		ib := db.Insert(table).Columns(columns...)
+		for _, row := range batch {
+			ib.Values(row...)
+		}
+
+		_, err := ib.Exec()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ConnectionChecker periodically checks database connectivity
+type ConnectionChecker struct {
+	db       *DB
+	interval time.Duration
+	healthy  bool
+}
+
+// NewConnectionChecker starts a background connection checker
+func NewConnectionChecker(db *DB, interval time.Duration) *ConnectionChecker {
+	cc := &ConnectionChecker{
+		db:       db,
+		interval: interval,
+		healthy:  true,
+	}
+	go cc.loop()
+	return cc
+}
+
+func (cc *ConnectionChecker) loop() {
+	for {
+		err := cc.db.db.Ping()
+		cc.healthy = err == nil
+		time.Sleep(cc.interval)
+	}
+}
+
+// IsHealthy returns current health status
+func (cc *ConnectionChecker) IsHealthy() bool {
+	return cc.healthy
+}

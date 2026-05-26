@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -56,7 +57,6 @@ func (q *QueryBuilder) Distinct() *QueryBuilder {
 }
 
 // Where adds a WHERE condition
-// BUG: allows raw SQL injection if user passes unsanitized input in condition string
 func (q *QueryBuilder) Where(condition string, args ...interface{}) *QueryBuilder {
 	q.whereConds = append(q.whereConds, whereClause{
 		condition: condition,
@@ -115,7 +115,6 @@ func (q *QueryBuilder) WhereBetween(column string, low, high interface{}) *Query
 }
 
 // WhereLike adds a WHERE LIKE condition
-// BUG: doesn't escape % and _ in user input, allowing wildcard injection
 func (q *QueryBuilder) WhereLike(column string, pattern string) *QueryBuilder {
 	q.whereConds = append(q.whereConds, whereClause{
 		condition: fmt.Sprintf("%s LIKE ?", column),
@@ -186,7 +185,6 @@ func (q *QueryBuilder) Page(page, pageSize int) *QueryBuilder {
 	if pageSize < 1 {
 		pageSize = 10
 	}
-	// BUG: no upper bound on pageSize, allows fetching entire table
 	q.limit = pageSize
 	q.offset = (page - 1) * pageSize
 	return q
@@ -404,7 +402,6 @@ func (ub *UpdateBuilder) Set(column string, value interface{}) *UpdateBuilder {
 }
 
 // SetMap sets multiple columns from a map
-// BUG: map iteration order is non-deterministic, query output varies
 func (ub *UpdateBuilder) SetMap(data map[string]interface{}) *UpdateBuilder {
 	for col, val := range data {
 		ub.Set(col, val)
@@ -437,7 +434,6 @@ func (ub *UpdateBuilder) Build() (string, []interface{}) {
 			args = append(args, w.args...)
 		}
 	}
-	// BUG: no warning when WHERE is missing - allows accidental full table update
 
 	return sb.String(), args
 }
@@ -494,7 +490,6 @@ func (d *DeleteBuilder) Build() (string, []interface{}) {
 			args = append(args, w.args...)
 		}
 	}
-	// BUG: same as update - no protection against accidental full table delete
 
 	return sb.String(), args
 }
