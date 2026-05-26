@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -359,6 +360,173 @@ func (m *Model) Restore(id interface{}) error {
 		m.info.TableName, m.info.SoftDelete, m.info.PrimaryKey)
 	_, err := m.db.Exec(query, id)
 	return err
+}
+
+// BatchUpdate updates rows matching a condition in fixed-size chunks to avoid
+// holding long-running locks on large tables.
+func (m *Model) BatchUpdate(column string, value interface{}, batchSize int, condition string, args ...interface{}) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	var totalAffected int64
+
+	for {
+		query := fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s LIMIT %d",
+			m.info.TableName, column, condition, batchSize)
+
+		allArgs := append([]interface{}{value}, args...)
+		result, err := m.db.Exec(query, allArgs...)
+		if err != nil {
+			return totalAffected, err
+		}
+
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return totalAffected, err
+		}
+
+		totalAffected += affected
+		if affected < int64(batchSize) {
+			break
+		}
+	}
+
+	return totalAffected, nil
+}
+
+// BatchDelete removes rows matching a condition in chunks to reduce lock contention
+func (m *Model) BatchDelete(batchSize int, condition string, args ...interface{}) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	var totalDeleted int64
+
+	for {
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s LIMIT %d",
+			m.info.TableName, condition, batchSize)
+
+		result, err := m.db.Exec(query, args...)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		totalDeleted += deleted
+		if deleted < int64(batchSize) {
+			break
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// FindByIDs retrieves multiple records by their primary keys
+func (m *Model) FindByIDs(dest interface{}, ids []interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// For large ID sets, use parallel chunked fetching
+	if len(ids) > 100 {
+		return m.findByIDsParallel(dest, ids)
+	}
+
+	placeholders := make([]string, len(ids))
+	for i := range ids {
+		placeholders[i] = "?"
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+		m.info.TableName,
+		m.info.PrimaryKey,
+		strings.Join(placeholders, ", "),
+	)
+
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	rows, err := m.db.Query(query, ids...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return scanSlice(rows, dest)
+}
+
+func (m *Model) findByIDsParallel(dest interface{}, ids []interface{}) error {
+	const chunkSize = 50
+
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("dest must be a pointer to slice")
+	}
+
+	sliceVal := rv.Elem()
+	elemType := sliceVal.Type().Elem()
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+
+	for i := 0; i < len(ids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+
+		wg.Add(1)
+		go func(chunkIDs []interface{}) {
+			defer wg.Done()
+
+			placeholders := make([]string, len(chunkIDs))
+			for j := range chunkIDs {
+				placeholders[j] = "?"
+			}
+
+			query := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+				m.info.TableName,
+				m.info.PrimaryKey,
+				strings.Join(placeholders, ", "),
+			)
+
+			rows, err := m.db.Query(query, chunkIDs...)
+			if err != nil {
+				firstErr = err
+				return
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				elem := reflect.New(elemType).Elem()
+				fields := make([]interface{}, elem.NumField())
+				for k := 0; k < elem.NumField(); k++ {
+					fields[k] = elem.Field(k).Addr().Interface()
+				}
+				if err := rows.Scan(fields...); err != nil {
+					firstErr = err
+					return
+				}
+				mu.Lock()
+				sliceVal.Set(reflect.Append(sliceVal, elem))
+				mu.Unlock()
+			}
+		}(chunk)
+	}
+
+	wg.Wait()
+	return firstErr
 }
 
 func (m *Model) getPKFieldName() string {

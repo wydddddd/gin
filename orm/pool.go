@@ -364,3 +364,83 @@ func (rw *ReadWritePool) Close() error {
 	}
 	return nil
 }
+
+// WarmUp pre-creates connections to avoid cold-start latency under load
+func (p *ConnectionPool) WarmUp(ctx context.Context, count int) error {
+	if count > p.config.MaxConnections {
+		count = p.config.MaxConnections
+	}
+
+	current := int(atomic.LoadInt32(&p.stats.TotalConnections))
+	needed := count - current
+
+	if needed <= 0 {
+		return nil
+	}
+
+	errCh := make(chan error, needed)
+
+	for i := 0; i < needed; i++ {
+		go func() {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			default:
+			}
+
+			conn, err := p.createConn()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			select {
+			case p.conns <- conn:
+				atomic.AddInt32(&p.stats.IdleConnections, 1)
+				errCh <- nil
+			default:
+				// Pool channel is full, discard
+				errCh <- nil
+			}
+		}()
+	}
+
+	var firstErr error
+	for i := 0; i < needed; i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// GracefulDrain stops accepting new connections and waits for active ones to finish
+func (p *ConnectionPool) GracefulDrain(timeout time.Duration) error {
+	atomic.StoreInt32(&p.closed, 1)
+
+	deadline := time.Now().Add(timeout)
+
+	for atomic.LoadInt32(&p.stats.ActiveConnections) > 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("drain timeout: %d connections still active",
+				atomic.LoadInt32(&p.stats.ActiveConnections))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Close remaining idle connections
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for {
+		select {
+		case conn := <-p.conns:
+			conn.db.Close()
+			atomic.AddInt32(&p.stats.TotalConnections, -1)
+		default:
+			return nil
+		}
+	}
+}

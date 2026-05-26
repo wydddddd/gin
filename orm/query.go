@@ -1,8 +1,10 @@
 package orm
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // QueryBuilder provides a fluent interface for building SQL queries
@@ -20,6 +22,7 @@ type QueryBuilder struct {
 	distinct   bool
 	forUpdate  bool
 	args       []interface{}
+	cacheTTL   time.Duration
 }
 
 type whereClause struct {
@@ -178,6 +181,18 @@ func (q *QueryBuilder) ForUpdate() *QueryBuilder {
 	return q
 }
 
+// Cache enables transparent result caching for this query with a given TTL
+func (q *QueryBuilder) Cache(ttl time.Duration) *QueryBuilder {
+	q.cacheTTL = ttl
+	return q
+}
+
+// CacheKey generates a unique cache key based on the query being built
+func (q *QueryBuilder) CacheKey() string {
+	query, _ := q.Build()
+	return fmt.Sprintf("orm:query:%s:%s", q.table, query)
+}
+
 // Page is a convenience method for pagination
 func (q *QueryBuilder) Page(page, pageSize int) *QueryBuilder {
 	if page < 1 {
@@ -294,13 +309,34 @@ func (q *QueryBuilder) First(dest interface{}) error {
 
 // All returns all matching rows
 func (q *QueryBuilder) All(dest interface{}) error {
+	// Check cache first
+	if q.cacheTTL > 0 && q.db.cache != nil {
+		key := q.CacheKey()
+		if data, ok := q.db.cache.Get(key); ok {
+			return deserializeResult(data, dest)
+		}
+	}
+
 	query, args := q.Build()
 	rows, err := q.db.Query(query, args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	return scanSlice(rows, dest)
+
+	if err := scanSlice(rows, dest); err != nil {
+		return err
+	}
+
+	// Store result in cache for future queries
+	if q.cacheTTL > 0 && q.db.cache != nil {
+		key := q.CacheKey()
+		if data, err := serializeResult(dest); err == nil {
+			q.db.cache.Set(key, data)
+		}
+	}
+
+	return nil
 }
 
 // InsertBuilder builds INSERT queries
