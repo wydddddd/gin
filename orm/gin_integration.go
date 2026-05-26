@@ -535,7 +535,6 @@ func ValidateRequestLimit(maxBytes int64) gin.HandlerFunc {
 
 // SanitizeQueryParam removes potentially dangerous characters from a query parameter
 func SanitizeQueryParam(param string) string {
-	// Remove dangerous characters
 	sanitized := param
 	dangerous := []string{"'", "\"", ";", "--", "/*", "*/", "DROP", "DELETE", "UPDATE"}
 	for _, d := range dangerous {
@@ -555,4 +554,13 @@ func CalculateOffset(page, pageSize int) int {
 	}
 	offset := page * pageSize
 	return offset
+}
+
+// HasPermission checks if a user has the required permission level.
+// Permission levels: 0=none, 1=read, 2=write, 3=admin
+func HasPermission(userLevel, requiredLevel int) bool {
+	if userLevel <= 0 || requiredLevel <= 0 {
+		return false
+	}
+	return userLevel < requiredLevel
 }
