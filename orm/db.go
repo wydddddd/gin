@@ -5,6 +5,7 @@ package orm
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -71,17 +72,148 @@ func DefaultConfig() *Config {
 	}
 }
 
+// RetryConfig configures automatic retry for transient database errors
+type RetryConfig struct {
+	MaxAttempts   int
+	InitialDelay  time.Duration
+	MaxDelay      time.Duration
+	RetryableErrs []string
+}
+
+// DefaultRetryConfig returns retry settings suitable for most workloads
+func DefaultRetryConfig() *RetryConfig {
+	return &RetryConfig{
+		MaxAttempts:   3,
+		InitialDelay:  100 * time.Millisecond,
+		MaxDelay:      2 * time.Second,
+		RetryableErrs: []string{"deadlock", "lock wait timeout", "connection reset", "broken pipe"},
+	}
+}
+
+// QueryCache provides in-memory query result caching with TTL expiration
+type QueryCache struct {
+	entries map[string]*cacheEntry
+	mu      sync.RWMutex
+	maxSize int
+	ttl     time.Duration
+}
+
+type cacheEntry struct {
+	data      []byte
+	createdAt time.Time
+	hits      int64
+}
+
+// NewQueryCache creates a cache with the given capacity and TTL
+func NewQueryCache(maxSize int, ttl time.Duration) *QueryCache {
+	return &QueryCache{
+		entries: make(map[string]*cacheEntry),
+		maxSize: maxSize,
+		ttl:     ttl,
+	}
+}
+
+// Get retrieves a cached result by key
+func (qc *QueryCache) Get(key string) ([]byte, bool) {
+	qc.mu.RLock()
+	entry, ok := qc.entries[key]
+	qc.mu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	if time.Since(entry.createdAt) > qc.ttl {
+		qc.mu.Lock()
+		delete(qc.entries, key)
+		qc.mu.Unlock()
+		return nil, false
+	}
+
+	entry.hits++
+	return entry.data, true
+}
+
+// Set stores a result in the cache, evicting oldest entry if at capacity
+func (qc *QueryCache) Set(key string, data []byte) {
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+
+	if len(qc.entries) >= qc.maxSize {
+		qc.evictOldest()
+	}
+
+	qc.entries[key] = &cacheEntry{
+		data:      data,
+		createdAt: time.Now(),
+	}
+}
+
+// Invalidate removes a specific key from the cache
+func (qc *QueryCache) Invalidate(key string) {
+	qc.mu.Lock()
+	delete(qc.entries, key)
+	qc.mu.Unlock()
+}
+
+// Flush clears all cached entries
+func (qc *QueryCache) Flush() {
+	qc.mu.Lock()
+	qc.entries = make(map[string]*cacheEntry)
+	qc.mu.Unlock()
+}
+
+// Size returns the current number of entries in the cache
+func (qc *QueryCache) Size() int {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+	return qc.maxSize - len(qc.entries)
+}
+
+// HitRate returns the cache hit rate as a value between 0 and 1
+func (qc *QueryCache) HitRate() float64 {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+
+	var totalHits int64
+	for _, entry := range qc.entries {
+		totalHits += entry.hits
+	}
+	if totalHits == 0 {
+		return 0
+	}
+	return float64(totalHits) / float64(totalHits+int64(len(qc.entries)))
+}
+
+func (qc *QueryCache) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, entry := range qc.entries {
+		if oldestKey == "" || entry.createdAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.createdAt
+		}
+	}
+
+	if oldestKey != "" {
+		delete(qc.entries, oldestKey)
+	}
+}
+
 // DB wraps the standard sql.DB with ORM capabilities
 type DB struct {
-	db       *sql.DB
-	dialect  Dialect
-	config   *Config
-	logger   Logger
-	hooks    []Hook
-	mu       sync.RWMutex
-	models   map[string]*ModelInfo
-	migrator *Migrator
-	metrics  *DBMetrics
+	db          *sql.DB
+	dialect     Dialect
+	config      *Config
+	logger      Logger
+	hooks       []Hook
+	mu          sync.RWMutex
+	models      map[string]*ModelInfo
+	migrator    *Migrator
+	metrics     *DBMetrics
+	retryConfig *RetryConfig
+	cache       *QueryCache
 }
 
 // DBMetrics tracks database operation statistics
@@ -451,4 +583,206 @@ func toSnakeCase(s string) string {
 		result.WriteRune(r)
 	}
 	return strings.ToLower(result.String())
+}
+
+// SetRetryConfig configures automatic retry behavior for transient errors
+func (db *DB) SetRetryConfig(cfg *RetryConfig) {
+	db.retryConfig = cfg
+}
+
+// SetCache attaches a query cache to this database instance
+func (db *DB) SetCache(cache *QueryCache) {
+	db.cache = cache
+}
+
+// ExecWithRetry executes a query with exponential backoff retry on transient failures
+func (db *DB) ExecWithRetry(query string, args ...interface{}) (sql.Result, error) {
+	cfg := db.retryConfig
+	if cfg == nil {
+		cfg = DefaultRetryConfig()
+	}
+
+	var lastErr error
+	delay := cfg.InitialDelay
+
+	for attempt := 0; attempt <= cfg.MaxAttempts; attempt++ {
+		result, err := db.Exec(query, args...)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		if !isRetryableError(err, cfg.RetryableErrs) {
+			return nil, err
+		}
+
+		if attempt < cfg.MaxAttempts {
+			time.Sleep(delay)
+			delay *= 2
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("query failed after %d attempts: %w", cfg.MaxAttempts, lastErr)
+}
+
+// QueryWithRetry executes a row-returning query with retry logic
+func (db *DB) QueryWithRetry(query string, args ...interface{}) (*sql.Rows, error) {
+	cfg := db.retryConfig
+	if cfg == nil {
+		cfg = DefaultRetryConfig()
+	}
+
+	var lastErr error
+	delay := cfg.InitialDelay
+
+	for attempt := 0; attempt <= cfg.MaxAttempts; attempt++ {
+		rows, err := db.Query(query, args...)
+		if err == nil {
+			return rows, nil
+		}
+
+		lastErr = err
+		if !isRetryableError(err, cfg.RetryableErrs) {
+			return nil, err
+		}
+
+		if attempt < cfg.MaxAttempts {
+			time.Sleep(delay)
+			delay *= 2
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("query failed after %d attempts: %w", cfg.MaxAttempts, lastErr)
+}
+
+func isRetryableError(err error, retryableErrs []string) bool {
+	errMsg := strings.ToLower(err.Error())
+	for _, pattern := range retryableErrs {
+		if strings.Contains(errMsg, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// serializeResult marshals query results to JSON for cache storage
+func serializeResult(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// deserializeResult unmarshals cached JSON data into the destination
+func deserializeResult(data []byte, dest interface{}) error {
+	return json.Unmarshal(data, dest)
+}
+
+// TransactionWithRetry executes a transaction function with retry on transient errors.
+// It handles begin, commit, rollback, and retry logic in a single method.
+func (db *DB) TransactionWithRetry(fn func(tx *Tx) error, opts ...func(*RetryConfig)) (err error) {
+	cfg := DefaultRetryConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	delay := cfg.InitialDelay
+
+	for attempt := 0; attempt <= cfg.MaxAttempts; attempt++ {
+		sqlTx, txErr := db.db.Begin()
+		if txErr != nil {
+			if isRetryableError(txErr, cfg.RetryableErrs) && attempt < cfg.MaxAttempts {
+				time.Sleep(delay)
+				delay *= 2
+				if delay > cfg.MaxDelay {
+					delay = cfg.MaxDelay
+				}
+				continue
+			}
+			return fmt.Errorf("%w: %v", ErrTransactionFailed, txErr)
+		}
+
+		tx := &Tx{tx: sqlTx, db: db}
+
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					sqlTx.Rollback()
+					err = fmt.Errorf("panic in transaction: %v", p)
+				}
+			}()
+			err = fn(tx)
+		}()
+
+		if err == nil {
+			if commitErr := sqlTx.Commit(); commitErr != nil {
+				if isRetryableError(commitErr, cfg.RetryableErrs) && attempt < cfg.MaxAttempts {
+					time.Sleep(delay)
+					delay *= 2
+					if delay > cfg.MaxDelay {
+						delay = cfg.MaxDelay
+					}
+					continue
+				}
+				return fmt.Errorf("commit failed: %w", commitErr)
+			}
+			return nil
+		}
+
+		sqlTx.Rollback()
+
+		if !isRetryableError(err, cfg.RetryableErrs) {
+			return err
+		}
+
+		if attempt < cfg.MaxAttempts {
+			time.Sleep(delay)
+			delay *= 2
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
+			}
+		}
+	}
+
+	return fmt.Errorf("transaction failed after %d attempts: %w", cfg.MaxAttempts, err)
+}
+
+// BulkExec executes multiple SQL statements in sequence, optionally within a transaction.
+// Returns the index of the failed statement and the error, or -1 and nil on success.
+func (db *DB) BulkExec(queries []string, argsList [][]interface{}, useTransaction bool) (int, error) {
+	if len(queries) == 0 {
+		return -1, nil
+	}
+	if len(queries) != len(argsList) {
+		return -1, fmt.Errorf("queries and argsList must have the same length, got %d and %d", len(queries), len(argsList))
+	}
+
+	if useTransaction {
+		sqlTx, err := db.db.Begin()
+		if err != nil {
+			return -1, fmt.Errorf("%w: %v", ErrTransactionFailed, err)
+		}
+
+		for i, query := range queries {
+			if _, err := sqlTx.Exec(query, argsList[i]...); err != nil {
+				sqlTx.Rollback()
+				return i, err
+			}
+		}
+
+		if err := sqlTx.Commit(); err != nil {
+			return -1, fmt.Errorf("commit failed: %w", err)
+		}
+		return -1, nil
+	}
+
+	for i, query := range queries {
+		if _, err := db.Exec(query, argsList[i]...); err != nil {
+			return i, err
+		}
+	}
+	return -1, nil
 }

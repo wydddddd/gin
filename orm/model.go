@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -361,6 +362,213 @@ func (m *Model) Restore(id interface{}) error {
 	return err
 }
 
+// BatchUpdate updates rows matching a condition in fixed-size chunks to avoid
+// holding long-running locks on large tables.
+func (m *Model) BatchUpdate(column string, value interface{}, batchSize int, condition string, args ...interface{}) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	var totalAffected int64
+
+	for {
+		query := fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s LIMIT %d",
+			m.info.TableName, column, condition, batchSize)
+
+		allArgs := append([]interface{}{value}, args...)
+		result, err := m.db.Exec(query, allArgs...)
+		if err != nil {
+			return totalAffected, err
+		}
+
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return totalAffected, err
+		}
+
+		totalAffected += affected
+		if affected < int64(batchSize) {
+			break
+		}
+	}
+
+	return totalAffected, nil
+}
+
+// BatchDelete removes rows matching a condition in chunks to reduce lock contention
+func (m *Model) BatchDelete(batchSize int, condition string, args ...interface{}) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	var totalDeleted int64
+
+	for {
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s LIMIT %d",
+			m.info.TableName, condition, batchSize)
+
+		result, err := m.db.Exec(query, args...)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		totalDeleted += deleted
+		if deleted < int64(batchSize) {
+			break
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// FindByIDs retrieves multiple records by their primary keys
+func (m *Model) FindByIDs(dest interface{}, ids []interface{}) error {
+	if m.info.PrimaryKey == "" {
+		return ErrNoPrimaryKey
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// For large ID sets, use parallel chunked fetching
+	if len(ids) > 100 {
+		return m.findByIDsParallel(dest, ids)
+	}
+
+	placeholders := make([]string, len(ids))
+	for i := range ids {
+		placeholders[i] = "?"
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+		m.info.TableName,
+		m.info.PrimaryKey,
+		strings.Join(placeholders, ", "),
+	)
+
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	rows, err := m.db.Query(query, ids...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return scanSlice(rows, dest)
+}
+
+// Exists checks whether a record with the given ID exists
+func (m *Model) Exists(id interface{}) (bool, error) {
+	if m.info.PrimaryKey == "" {
+		return false, ErrNoPrimaryKey
+	}
+
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = ?",
+		m.info.TableName, m.info.PrimaryKey)
+
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	var count int64
+	err := m.db.QueryRow(query, id).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+// DeleteWhere deletes all records matching the given condition.
+// Returns the number of affected rows.
+func (m *Model) DeleteWhere(condition string, args ...interface{}) (int64, error) {
+	var query string
+	if m.info.SoftDelete != "" {
+		query = fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s",
+			m.info.TableName, m.info.SoftDelete, condition)
+		args = append([]interface{}{time.Now()}, args...)
+	} else {
+		query = fmt.Sprintf("DELETE FROM %s WHERE %s", m.info.TableName, condition)
+	}
+
+	result, err := m.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (m *Model) findByIDsParallel(dest interface{}, ids []interface{}) error {
+	const chunkSize = 50
+
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("dest must be a pointer to slice")
+	}
+
+	sliceVal := rv.Elem()
+	elemType := sliceVal.Type().Elem()
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+
+	for i := 0; i < len(ids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+
+		wg.Add(1)
+		go func(chunkIDs []interface{}) {
+			defer wg.Done()
+
+			placeholders := make([]string, len(chunkIDs))
+			for j := range chunkIDs {
+				placeholders[j] = "?"
+			}
+
+			query := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+				m.info.TableName,
+				m.info.PrimaryKey,
+				strings.Join(placeholders, ", "),
+			)
+
+			rows, err := m.db.Query(query, chunkIDs...)
+			if err != nil {
+				firstErr = err
+				return
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				elem := reflect.New(elemType).Elem()
+				fields := make([]interface{}, elem.NumField())
+				for k := 0; k < elem.NumField(); k++ {
+					fields[k] = elem.Field(k).Addr().Interface()
+				}
+				if err := rows.Scan(fields...); err != nil {
+					firstErr = err
+					return
+				}
+				mu.Lock()
+				sliceVal.Set(reflect.Append(sliceVal, elem))
+				mu.Unlock()
+			}
+		}(chunk)
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
 func (m *Model) getPKFieldName() string {
 	for _, field := range m.info.Fields {
 		if field.IsPrimary {
@@ -368,6 +576,144 @@ func (m *Model) getPKFieldName() string {
 		}
 	}
 	return ""
+}
+
+// Paginate retrieves records with pagination, sorting, and optional filtering.
+// Returns the records, total count, and any error.
+func (m *Model) Paginate(dest interface{}, page, pageSize int, sortCol, sortDir string, filters map[string]interface{}) (int64, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", m.info.TableName)
+	selectQuery := fmt.Sprintf("SELECT * FROM %s", m.info.TableName)
+
+	var whereClauses []string
+	var args []interface{}
+
+	if m.info.SoftDelete != "" {
+		whereClauses = append(whereClauses, fmt.Sprintf("%s IS NULL", m.info.SoftDelete))
+	}
+
+	if filters != nil {
+		for col, val := range filters {
+			switch v := val.(type) {
+			case string:
+				if strings.Contains(v, "%") {
+					whereClauses = append(whereClauses, fmt.Sprintf("%s LIKE ?", col))
+					args = append(args, v)
+				} else {
+					whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
+					args = append(args, v)
+				}
+			case []interface{}:
+				if len(v) > 0 {
+					placeholders := make([]string, len(v))
+					for i := range v {
+						placeholders[i] = "?"
+					}
+					whereClauses = append(whereClauses, fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ",")))
+					args = append(args, v...)
+				}
+			case nil:
+				whereClauses = append(whereClauses, fmt.Sprintf("%s IS NULL", col))
+			default:
+				whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
+				args = append(args, v)
+			}
+		}
+	}
+
+	if len(whereClauses) > 0 {
+		whereStr := " WHERE " + strings.Join(whereClauses, " AND ")
+		countQuery += whereStr
+		selectQuery += whereStr
+	}
+
+	var total int64
+	err := m.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+
+	if sortCol != "" {
+		direction := "ASC"
+		if strings.ToUpper(sortDir) == "DESC" {
+			direction = "DESC"
+		}
+		selectQuery += fmt.Sprintf(" ORDER BY %s %s", sortCol, direction)
+	}
+
+	offset := (page - 1) * pageSize
+	selectQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize, offset)
+
+	rows, err := m.db.Query(selectQuery, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	if err := scanSlice(rows, dest); err != nil {
+		return 0, err
+	}
+
+	return total, nil
+}
+
+// Upsert inserts a record or updates it if a conflict occurs on the primary key.
+// The columnsToUpdate parameter specifies which columns to update on conflict.
+func (m *Model) Upsert(record interface{}, columnsToUpdate []string) error {
+	v := reflect.ValueOf(record)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	columns := make([]string, 0)
+	values := make([]interface{}, 0)
+	placeholders := make([]string, 0)
+
+	for _, field := range m.info.Fields {
+		if field.IsAutoInc {
+			continue
+		}
+		fv := v.FieldByName(field.Name)
+		if !fv.IsValid() {
+			continue
+		}
+		if field.Column == m.info.CreatedAt || field.Column == m.info.UpdatedAt {
+			if fv.Type() == reflect.TypeOf(time.Time{}) && fv.Interface().(time.Time).IsZero() {
+				fv.Set(reflect.ValueOf(time.Now()))
+			}
+		}
+		columns = append(columns, field.Column)
+		values = append(values, fv.Interface())
+		placeholders = append(placeholders, "?")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		m.info.TableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	))
+
+	if len(columnsToUpdate) > 0 {
+		updates := make([]string, len(columnsToUpdate))
+		for i, col := range columnsToUpdate {
+			updates[i] = fmt.Sprintf("%s = VALUES(%s)", col, col)
+		}
+		sb.WriteString(" ON DUPLICATE KEY UPDATE ")
+		sb.WriteString(strings.Join(updates, ", "))
+	}
+
+	_, err := m.db.Exec(sb.String(), values...)
+	return err
 }
 
 // scanStruct scans a single row into a struct

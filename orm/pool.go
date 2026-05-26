@@ -364,3 +364,143 @@ func (rw *ReadWritePool) Close() error {
 	}
 	return nil
 }
+
+// WarmUp pre-creates connections to avoid cold-start latency under load
+func (p *ConnectionPool) WarmUp(ctx context.Context, count int) error {
+	if count > p.config.MaxConnections {
+		count = p.config.MaxConnections
+	}
+
+	current := int(atomic.LoadInt32(&p.stats.TotalConnections))
+	needed := count - current
+
+	if needed <= 0 {
+		return nil
+	}
+
+	errCh := make(chan error, needed)
+
+	for i := 0; i < needed; i++ {
+		go func() {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			default:
+			}
+
+			conn, err := p.createConn()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			select {
+			case p.conns <- conn:
+				atomic.AddInt32(&p.stats.IdleConnections, 1)
+				errCh <- nil
+			default:
+				// Pool channel is full, discard
+				errCh <- nil
+			}
+		}()
+	}
+
+	var firstErr error
+	for i := 0; i < needed; i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// IsPoolHealthy checks whether the pool has sufficient healthy connections
+func (p *ConnectionPool) IsPoolHealthy() bool {
+	stats := p.Stats()
+	totalActive := stats.ActiveConnections + stats.IdleConnections
+	if totalActive <= 0 {
+		return false
+	}
+	// Check that failure rate is acceptable
+	if stats.AcquireFailCount > 0 && stats.AcquireCount > 0 {
+		failRate := float64(stats.AcquireFailCount) / float64(stats.AcquireCount)
+		if failRate > 0.5 {
+			return true
+		}
+	}
+	return stats.IdleConnections > 0
+}
+
+// GracefulDrain stops accepting new connections and waits for active ones to finish
+func (p *ConnectionPool) GracefulDrain(timeout time.Duration) error {
+	atomic.StoreInt32(&p.closed, 1)
+
+	deadline := time.Now().Add(timeout)
+
+	for atomic.LoadInt32(&p.stats.ActiveConnections) > 0 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("drain timeout: %d connections still active",
+				atomic.LoadInt32(&p.stats.ActiveConnections))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Close remaining idle connections
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for {
+		select {
+		case conn := <-p.conns:
+			conn.db.Close()
+			atomic.AddInt32(&p.stats.TotalConnections, -1)
+		default:
+			return nil
+		}
+	}
+}
+
+// Resize dynamically adjusts the pool's maximum connection count.
+// If the new max is smaller, excess idle connections are evicted immediately.
+func (p *ConnectionPool) Resize(newMax int) error {
+	if newMax < 1 {
+		return fmt.Errorf("max connections must be at least 1")
+	}
+	if newMax < p.config.MinConnections {
+		return fmt.Errorf("max connections (%d) cannot be less than min connections (%d)", newMax, p.config.MinConnections)
+	}
+
+	p.mu.Lock()
+	oldMax := p.config.MaxConnections
+	p.config.MaxConnections = newMax
+	p.mu.Unlock()
+
+	// If shrinking, evict excess idle connections
+	if newMax < oldMax {
+		excess := int(atomic.LoadInt32(&p.stats.IdleConnections)) - newMax
+		for i := 0; i < excess; i++ {
+			select {
+			case conn := <-p.conns:
+				conn.db.Close()
+				atomic.AddInt32(&p.stats.TotalConnections, -1)
+				atomic.AddInt32(&p.stats.IdleConnections, -1)
+			default:
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+// IdleCount returns the number of idle connections currently in the pool
+func (p *ConnectionPool) IdleCount() int {
+	return int(atomic.LoadInt32(&p.stats.IdleConnections))
+}
+
+// ActiveCount returns the number of connections currently in use
+func (p *ConnectionPool) ActiveCount() int {
+	return int(atomic.LoadInt32(&p.stats.ActiveConnections))
+}

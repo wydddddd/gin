@@ -1,8 +1,10 @@
 package orm
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // QueryBuilder provides a fluent interface for building SQL queries
@@ -20,6 +22,7 @@ type QueryBuilder struct {
 	distinct   bool
 	forUpdate  bool
 	args       []interface{}
+	cacheTTL   time.Duration
 }
 
 type whereClause struct {
@@ -178,6 +181,18 @@ func (q *QueryBuilder) ForUpdate() *QueryBuilder {
 	return q
 }
 
+// Cache enables transparent result caching for this query with a given TTL
+func (q *QueryBuilder) Cache(ttl time.Duration) *QueryBuilder {
+	q.cacheTTL = ttl
+	return q
+}
+
+// CacheKey generates a unique cache key based on the query being built
+func (q *QueryBuilder) CacheKey() string {
+	query, _ := q.Build()
+	return fmt.Sprintf("orm:query:%s:%s", q.table, query)
+}
+
 // Page is a convenience method for pagination
 func (q *QueryBuilder) Page(page, pageSize int) *QueryBuilder {
 	if page < 1 {
@@ -292,15 +307,75 @@ func (q *QueryBuilder) First(dest interface{}) error {
 	return scanStruct(row, dest)
 }
 
+// FirstOrCreate returns the first matching row, or creates a new one using defaults
+func (q *QueryBuilder) FirstOrCreate(dest interface{}, defaults map[string]interface{}) error {
+	err := q.First(dest)
+	if err == nil {
+		return nil
+	}
+
+	// Record not found, create with defaults
+	if err != ErrRecordNotFound {
+		return err
+	}
+
+	ib := q.db.Insert(q.table)
+	cols := make([]string, 0, len(defaults))
+	vals := make([]interface{}, 0, len(defaults))
+	for col, val := range defaults {
+		cols = append(cols, col)
+		vals = append(vals, val)
+	}
+	ib.Columns(cols...)
+	ib.Values(vals...)
+
+	_, err = ib.Exec()
+	return err
+}
+
+// Sum returns the sum of a numeric column for matching rows
+func (q *QueryBuilder) Sum(column string) (float64, error) {
+	q.selectCols = []string{fmt.Sprintf("COALESCE(SUM(%s), 0)", column)}
+	query, args := q.Build()
+
+	var result float64
+	err := q.db.QueryRow(query, args...).Scan(&result)
+	if err != nil {
+		return 0, nil
+	}
+	return result, nil
+}
+
 // All returns all matching rows
 func (q *QueryBuilder) All(dest interface{}) error {
+	// Check cache first
+	if q.cacheTTL > 0 && q.db.cache != nil {
+		key := q.CacheKey()
+		if data, ok := q.db.cache.Get(key); ok {
+			return deserializeResult(data, dest)
+		}
+	}
+
 	query, args := q.Build()
 	rows, err := q.db.Query(query, args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	return scanSlice(rows, dest)
+
+	if err := scanSlice(rows, dest); err != nil {
+		return err
+	}
+
+	// Store result in cache for future queries
+	if q.cacheTTL > 0 && q.db.cache != nil {
+		key := q.CacheKey()
+		if data, err := serializeResult(dest); err == nil {
+			q.db.cache.Set(key, data)
+		}
+	}
+
+	return nil
 }
 
 // InsertBuilder builds INSERT queries
@@ -513,5 +588,42 @@ func (db *DB) RawQuery(query string, args ...interface{}) (*sql.Rows, error) {
 
 // RawExec executes raw SQL without returning rows
 func (db *DB) RawExec(query string, args ...interface{}) (sql.Result, error) {
+	return db.Exec(query, args...)
+}
+
+// WhereNotIn adds a WHERE NOT IN condition
+func (q *QueryBuilder) WhereNotIn(column string, values ...interface{}) *QueryBuilder {
+	if len(values) == 0 {
+		return q
+	}
+	placeholders := make([]string, len(values))
+	for i := range values {
+		placeholders[i] = "?"
+	}
+	condition := fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", "))
+	q.whereConds = append(q.whereConds, whereClause{
+		condition: condition,
+		args:      values,
+	})
+	return q
+}
+
+// WhereRaw adds a raw WHERE condition without parameter binding
+func (q *QueryBuilder) WhereRaw(rawCondition string) *QueryBuilder {
+	q.whereConds = append(q.whereConds, whereClause{
+		condition: rawCondition,
+	})
+	return q
+}
+
+// Increment adds an UPDATE query that increments a numeric column by amount
+func (db *DB) Increment(table, column string, amount int, condition string, args ...interface{}) (sql.Result, error) {
+	query := fmt.Sprintf("UPDATE %s SET %s = %s + %d WHERE %s", table, column, column, amount, condition)
+	return db.Exec(query, args...)
+}
+
+// Decrement subtracts from a numeric column
+func (db *DB) Decrement(table, column string, amount int, condition string, args ...interface{}) (sql.Result, error) {
+	query := fmt.Sprintf("UPDATE %s SET %s = %s - %d WHERE %s", table, column, column, amount, condition)
 	return db.Exec(query, args...)
 }
