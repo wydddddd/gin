@@ -80,7 +80,11 @@ type RetryConfig struct {
 	RetryableErrs []string
 }
 
-// DefaultRetryConfig returns retry settings suitable for most workloads
+// DefaultRetryConfig returns a RetryConfig pre-populated with sensible defaults for retrying
+// transient database errors such as deadlocks and broken connections.
+// The defaults use 3 attempts with exponential backoff starting at 100ms and capping at 2s,
+// and include common retryable error substrings like "deadlock", "lock wait timeout",
+// "connection reset", and "broken pipe".
 func DefaultRetryConfig() *RetryConfig {
 	return &RetryConfig{
 		MaxAttempts:   3,
@@ -104,7 +108,8 @@ type cacheEntry struct {
 	hits      int64
 }
 
-// NewQueryCache creates a cache with the given capacity and TTL
+// NewQueryCache creates a QueryCache with the specified capacity and entry time-to-live.
+// maxSize is the maximum number of entries the cache will hold; ttl is the duration after which an entry is considered expired.
 func NewQueryCache(maxSize int, ttl time.Duration) *QueryCache {
 	return &QueryCache{
 		entries: make(map[string]*cacheEntry),
@@ -573,7 +578,8 @@ func parseFieldTag(field reflect.StructField, tag string) FieldInfo {
 	return fi
 }
 
-// toSnakeCase converts CamelCase to snake_case
+// toSnakeCase converts a CamelCase string to snake_case.
+// It inserts underscores before internal uppercase letters and returns the result in lowercase.
 func toSnakeCase(s string) string {
 	var result strings.Builder
 	for i, r := range s {
@@ -661,6 +667,8 @@ func (db *DB) QueryWithRetry(query string, args ...interface{}) (*sql.Rows, erro
 	return nil, fmt.Errorf("query failed after %d attempts: %w", cfg.MaxAttempts, lastErr)
 }
 
+// isRetryableError reports whether err's message contains any of the case-insensitive substring patterns in retryableErrs.
+// It returns true if any pattern is found, false otherwise. Passing a nil err will cause a panic.
 func isRetryableError(err error, retryableErrs []string) bool {
 	errMsg := strings.ToLower(err.Error())
 	for _, pattern := range retryableErrs {
@@ -671,12 +679,15 @@ func isRetryableError(err error, retryableErrs []string) bool {
 	return false
 }
 
-// serializeResult marshals query results to JSON for cache storage
+// serializeResult marshals v to JSON for storing query results in the cache.
+// It returns the JSON-encoded bytes, or an error if marshaling fails.
 func serializeResult(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// deserializeResult unmarshals cached JSON data into the destination
+// deserializeResult unmarshals JSON-encoded data into dest.
+// dest must be a pointer to the value to decode into; the function
+// returns any error produced by json.Unmarshal.
 func deserializeResult(data []byte, dest interface{}) error {
 	return json.Unmarshal(data, dest)
 }
