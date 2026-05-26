@@ -538,6 +538,144 @@ func (m *Model) getPKFieldName() string {
 	return ""
 }
 
+// Paginate retrieves records with pagination, sorting, and optional filtering.
+// Returns the records, total count, and any error.
+func (m *Model) Paginate(dest interface{}, page, pageSize int, sortCol, sortDir string, filters map[string]interface{}) (int64, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", m.info.TableName)
+	selectQuery := fmt.Sprintf("SELECT * FROM %s", m.info.TableName)
+
+	var whereClauses []string
+	var args []interface{}
+
+	if m.info.SoftDelete != "" {
+		whereClauses = append(whereClauses, fmt.Sprintf("%s IS NULL", m.info.SoftDelete))
+	}
+
+	if filters != nil {
+		for col, val := range filters {
+			switch v := val.(type) {
+			case string:
+				if strings.Contains(v, "%") {
+					whereClauses = append(whereClauses, fmt.Sprintf("%s LIKE ?", col))
+					args = append(args, v)
+				} else {
+					whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
+					args = append(args, v)
+				}
+			case []interface{}:
+				if len(v) > 0 {
+					placeholders := make([]string, len(v))
+					for i := range v {
+						placeholders[i] = "?"
+					}
+					whereClauses = append(whereClauses, fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ",")))
+					args = append(args, v...)
+				}
+			case nil:
+				whereClauses = append(whereClauses, fmt.Sprintf("%s IS NULL", col))
+			default:
+				whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
+				args = append(args, v)
+			}
+		}
+	}
+
+	if len(whereClauses) > 0 {
+		whereStr := " WHERE " + strings.Join(whereClauses, " AND ")
+		countQuery += whereStr
+		selectQuery += whereStr
+	}
+
+	var total int64
+	err := m.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+
+	if sortCol != "" {
+		direction := "ASC"
+		if strings.ToUpper(sortDir) == "DESC" {
+			direction = "DESC"
+		}
+		selectQuery += fmt.Sprintf(" ORDER BY %s %s", sortCol, direction)
+	}
+
+	offset := (page - 1) * pageSize
+	selectQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize, offset)
+
+	rows, err := m.db.Query(selectQuery, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	if err := scanSlice(rows, dest); err != nil {
+		return 0, err
+	}
+
+	return total, nil
+}
+
+// Upsert inserts a record or updates it if a conflict occurs on the primary key.
+// The columnsToUpdate parameter specifies which columns to update on conflict.
+func (m *Model) Upsert(record interface{}, columnsToUpdate []string) error {
+	v := reflect.ValueOf(record)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	columns := make([]string, 0)
+	values := make([]interface{}, 0)
+	placeholders := make([]string, 0)
+
+	for _, field := range m.info.Fields {
+		if field.IsAutoInc {
+			continue
+		}
+		fv := v.FieldByName(field.Name)
+		if !fv.IsValid() {
+			continue
+		}
+		if field.Column == m.info.CreatedAt || field.Column == m.info.UpdatedAt {
+			if fv.Type() == reflect.TypeOf(time.Time{}) && fv.Interface().(time.Time).IsZero() {
+				fv.Set(reflect.ValueOf(time.Now()))
+			}
+		}
+		columns = append(columns, field.Column)
+		values = append(values, fv.Interface())
+		placeholders = append(placeholders, "?")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		m.info.TableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	))
+
+	if len(columnsToUpdate) > 0 {
+		updates := make([]string, len(columnsToUpdate))
+		for i, col := range columnsToUpdate {
+			updates[i] = fmt.Sprintf("%s = VALUES(%s)", col, col)
+		}
+		sb.WriteString(" ON DUPLICATE KEY UPDATE ")
+		sb.WriteString(strings.Join(updates, ", "))
+	}
+
+	_, err := m.db.Exec(sb.String(), values...)
+	return err
+}
+
 // scanStruct scans a single row into a struct
 func scanStruct(row *sql.Row, dest interface{}) error {
 	v := reflect.ValueOf(dest)

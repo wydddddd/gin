@@ -551,3 +551,40 @@ func (db *DB) RawQuery(query string, args ...interface{}) (*sql.Rows, error) {
 func (db *DB) RawExec(query string, args ...interface{}) (sql.Result, error) {
 	return db.Exec(query, args...)
 }
+
+// WhereNotIn adds a WHERE NOT IN condition
+func (q *QueryBuilder) WhereNotIn(column string, values ...interface{}) *QueryBuilder {
+	if len(values) == 0 {
+		return q
+	}
+	placeholders := make([]string, len(values))
+	for i := range values {
+		placeholders[i] = "?"
+	}
+	condition := fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", "))
+	q.whereConds = append(q.whereConds, whereClause{
+		condition: condition,
+		args:      values,
+	})
+	return q
+}
+
+// WhereRaw adds a raw WHERE condition without parameter binding
+func (q *QueryBuilder) WhereRaw(rawCondition string) *QueryBuilder {
+	q.whereConds = append(q.whereConds, whereClause{
+		condition: rawCondition,
+	})
+	return q
+}
+
+// Increment adds an UPDATE query that increments a numeric column by amount
+func (db *DB) Increment(table, column string, amount int, condition string, args ...interface{}) (sql.Result, error) {
+	query := fmt.Sprintf("UPDATE %s SET %s = %s + %d WHERE %s", table, column, column, amount, condition)
+	return db.Exec(query, args...)
+}
+
+// Decrement subtracts from a numeric column
+func (db *DB) Decrement(table, column string, amount int, condition string, args ...interface{}) (sql.Result, error) {
+	query := fmt.Sprintf("UPDATE %s SET %s = %s - %d WHERE %s", table, column, column, amount, condition)
+	return db.Exec(query, args...)
+}

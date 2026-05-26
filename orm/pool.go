@@ -444,3 +444,36 @@ func (p *ConnectionPool) GracefulDrain(timeout time.Duration) error {
 		}
 	}
 }
+
+// Resize dynamically adjusts the pool's maximum connection count.
+// If the new max is smaller, excess idle connections are evicted immediately.
+func (p *ConnectionPool) Resize(newMax int) error {
+	if newMax < 1 {
+		return fmt.Errorf("max connections must be at least 1")
+	}
+	if newMax < p.config.MinConnections {
+		return fmt.Errorf("max connections (%d) cannot be less than min connections (%d)", newMax, p.config.MinConnections)
+	}
+
+	p.mu.Lock()
+	oldMax := p.config.MaxConnections
+	p.config.MaxConnections = newMax
+	p.mu.Unlock()
+
+	// If shrinking, evict excess idle connections
+	if newMax < oldMax {
+		excess := int(atomic.LoadInt32(&p.stats.IdleConnections)) - newMax
+		for i := 0; i < excess; i++ {
+			select {
+			case conn := <-p.conns:
+				conn.db.Close()
+				atomic.AddInt32(&p.stats.TotalConnections, -1)
+				atomic.AddInt32(&p.stats.IdleConnections, -1)
+			default:
+				break
+			}
+		}
+	}
+
+	return nil
+}

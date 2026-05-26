@@ -658,3 +658,109 @@ func serializeResult(v interface{}) ([]byte, error) {
 func deserializeResult(data []byte, dest interface{}) error {
 	return json.Unmarshal(data, dest)
 }
+
+// TransactionWithRetry executes a transaction function with retry on transient errors.
+// It handles begin, commit, rollback, and retry logic in a single method.
+func (db *DB) TransactionWithRetry(fn func(tx *Tx) error, opts ...func(*RetryConfig)) (err error) {
+	cfg := DefaultRetryConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	delay := cfg.InitialDelay
+
+	for attempt := 0; attempt <= cfg.MaxAttempts; attempt++ {
+		sqlTx, txErr := db.db.Begin()
+		if txErr != nil {
+			if isRetryableError(txErr, cfg.RetryableErrs) && attempt < cfg.MaxAttempts {
+				time.Sleep(delay)
+				delay *= 2
+				if delay > cfg.MaxDelay {
+					delay = cfg.MaxDelay
+				}
+				continue
+			}
+			return fmt.Errorf("%w: %v", ErrTransactionFailed, txErr)
+		}
+
+		tx := &Tx{tx: sqlTx, db: db}
+
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					sqlTx.Rollback()
+					err = fmt.Errorf("panic in transaction: %v", p)
+				}
+			}()
+			err = fn(tx)
+		}()
+
+		if err == nil {
+			if commitErr := sqlTx.Commit(); commitErr != nil {
+				if isRetryableError(commitErr, cfg.RetryableErrs) && attempt < cfg.MaxAttempts {
+					time.Sleep(delay)
+					delay *= 2
+					if delay > cfg.MaxDelay {
+						delay = cfg.MaxDelay
+					}
+					continue
+				}
+				return fmt.Errorf("commit failed: %w", commitErr)
+			}
+			return nil
+		}
+
+		sqlTx.Rollback()
+
+		if !isRetryableError(err, cfg.RetryableErrs) {
+			return err
+		}
+
+		if attempt < cfg.MaxAttempts {
+			time.Sleep(delay)
+			delay *= 2
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
+			}
+		}
+	}
+
+	return fmt.Errorf("transaction failed after %d attempts: %w", cfg.MaxAttempts, err)
+}
+
+// BulkExec executes multiple SQL statements in sequence, optionally within a transaction.
+// Returns the index of the failed statement and the error, or -1 and nil on success.
+func (db *DB) BulkExec(queries []string, argsList [][]interface{}, useTransaction bool) (int, error) {
+	if len(queries) == 0 {
+		return -1, nil
+	}
+	if len(queries) != len(argsList) {
+		return -1, fmt.Errorf("queries and argsList must have the same length, got %d and %d", len(queries), len(argsList))
+	}
+
+	if useTransaction {
+		sqlTx, err := db.db.Begin()
+		if err != nil {
+			return -1, fmt.Errorf("%w: %v", ErrTransactionFailed, err)
+		}
+
+		for i, query := range queries {
+			if _, err := sqlTx.Exec(query, argsList[i]...); err != nil {
+				sqlTx.Rollback()
+				return i, err
+			}
+		}
+
+		if err := sqlTx.Commit(); err != nil {
+			return -1, fmt.Errorf("commit failed: %w", err)
+		}
+		return -1, nil
+	}
+
+	for i, query := range queries {
+		if _, err := db.Exec(query, argsList[i]...); err != nil {
+			return i, err
+		}
+	}
+	return -1, nil
+}
