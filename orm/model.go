@@ -716,7 +716,9 @@ func (m *Model) Upsert(record interface{}, columnsToUpdate []string) error {
 	return err
 }
 
-// scanStruct scans a single row into a struct
+// scanStruct scans a sql.Row into the provided struct pointer.
+// The dest must be a pointer to a struct; if not, ErrInvalidModel is returned.
+// It calls row.Scan with the addresses of the struct's fields in declaration order and returns any scan error.
 func scanStruct(row *sql.Row, dest interface{}) error {
 	v := reflect.ValueOf(dest)
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
