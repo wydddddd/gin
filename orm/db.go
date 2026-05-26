@@ -163,6 +163,28 @@ func (qc *QueryCache) Flush() {
 	qc.mu.Unlock()
 }
 
+// Size returns the current number of entries in the cache
+func (qc *QueryCache) Size() int {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+	return qc.maxSize - len(qc.entries)
+}
+
+// HitRate returns the cache hit rate as a value between 0 and 1
+func (qc *QueryCache) HitRate() float64 {
+	qc.mu.RLock()
+	defer qc.mu.RUnlock()
+
+	var totalHits int64
+	for _, entry := range qc.entries {
+		totalHits += entry.hits
+	}
+	if totalHits == 0 {
+		return 0
+	}
+	return float64(totalHits) / float64(totalHits+int64(len(qc.entries)))
+}
+
 func (qc *QueryCache) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time

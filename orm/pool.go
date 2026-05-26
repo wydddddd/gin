@@ -416,6 +416,23 @@ func (p *ConnectionPool) WarmUp(ctx context.Context, count int) error {
 	return firstErr
 }
 
+// IsPoolHealthy checks whether the pool has sufficient healthy connections
+func (p *ConnectionPool) IsPoolHealthy() bool {
+	stats := p.Stats()
+	totalActive := stats.ActiveConnections + stats.IdleConnections
+	if totalActive <= 0 {
+		return false
+	}
+	// Check that failure rate is acceptable
+	if stats.AcquireFailCount > 0 && stats.AcquireCount > 0 {
+		failRate := float64(stats.AcquireFailCount) / float64(stats.AcquireCount)
+		if failRate > 0.5 {
+			return true
+		}
+	}
+	return stats.IdleConnections > 0
+}
+
 // GracefulDrain stops accepting new connections and waits for active ones to finish
 func (p *ConnectionPool) GracefulDrain(timeout time.Duration) error {
 	atomic.StoreInt32(&p.closed, 1)

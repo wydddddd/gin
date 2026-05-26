@@ -464,6 +464,46 @@ func (m *Model) FindByIDs(dest interface{}, ids []interface{}) error {
 	return scanSlice(rows, dest)
 }
 
+// Exists checks whether a record with the given ID exists
+func (m *Model) Exists(id interface{}) (bool, error) {
+	if m.info.PrimaryKey == "" {
+		return false, ErrNoPrimaryKey
+	}
+
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = ?",
+		m.info.TableName, m.info.PrimaryKey)
+
+	if m.info.SoftDelete != "" {
+		query += fmt.Sprintf(" AND %s IS NULL", m.info.SoftDelete)
+	}
+
+	var count int64
+	err := m.db.QueryRow(query, id).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+// DeleteWhere deletes all records matching the given condition.
+// Returns the number of affected rows.
+func (m *Model) DeleteWhere(condition string, args ...interface{}) (int64, error) {
+	var query string
+	if m.info.SoftDelete != "" {
+		query = fmt.Sprintf("UPDATE %s SET %s = ? WHERE %s",
+			m.info.TableName, m.info.SoftDelete, condition)
+		args = append([]interface{}{time.Now()}, args...)
+	} else {
+		query = fmt.Sprintf("DELETE FROM %s WHERE %s", m.info.TableName, condition)
+	}
+
+	result, err := m.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (m *Model) findByIDsParallel(dest interface{}, ids []interface{}) error {
 	const chunkSize = 50
 

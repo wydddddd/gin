@@ -307,6 +307,45 @@ func (q *QueryBuilder) First(dest interface{}) error {
 	return scanStruct(row, dest)
 }
 
+// FirstOrCreate returns the first matching row, or creates a new one using defaults
+func (q *QueryBuilder) FirstOrCreate(dest interface{}, defaults map[string]interface{}) error {
+	err := q.First(dest)
+	if err == nil {
+		return nil
+	}
+
+	// Record not found, create with defaults
+	if err != ErrRecordNotFound {
+		return err
+	}
+
+	ib := q.db.Insert(q.table)
+	cols := make([]string, 0, len(defaults))
+	vals := make([]interface{}, 0, len(defaults))
+	for col, val := range defaults {
+		cols = append(cols, col)
+		vals = append(vals, val)
+	}
+	ib.Columns(cols...)
+	ib.Values(vals...)
+
+	_, err = ib.Exec()
+	return err
+}
+
+// Sum returns the sum of a numeric column for matching rows
+func (q *QueryBuilder) Sum(column string) (float64, error) {
+	q.selectCols = []string{fmt.Sprintf("COALESCE(SUM(%s), 0)", column)}
+	query, args := q.Build()
+
+	var result float64
+	err := q.db.QueryRow(query, args...).Scan(&result)
+	if err != nil {
+		return 0, nil
+	}
+	return result, nil
+}
+
 // All returns all matching rows
 func (q *QueryBuilder) All(dest interface{}) error {
 	// Check cache first
