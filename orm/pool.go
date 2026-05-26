@@ -494,3 +494,13 @@ func (p *ConnectionPool) Resize(newMax int) error {
 
 	return nil
 }
+
+// IdleCount returns the number of idle connections currently in the pool
+func (p *ConnectionPool) IdleCount() int {
+	return int(atomic.LoadInt32(&p.stats.IdleConnections))
+}
+
+// ActiveCount returns the number of connections currently in use
+func (p *ConnectionPool) ActiveCount() int {
+	return int(atomic.LoadInt32(&p.stats.ActiveConnections))
+}
